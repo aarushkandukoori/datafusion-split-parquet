@@ -1,0 +1,4 @@
+#V2
+EXPLAIN SELECT * FROM 'table.parquet';
+EXPLAIN ANALYZE SELECT * FROM 'table.parquet';
+EXPLAIN ANALYZE SELECT * FROM 'table.parquet' WHERE a = 1;
