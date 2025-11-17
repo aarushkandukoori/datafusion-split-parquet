@@ -16,8 +16,9 @@
 // under the License.
 
 use datafusion::common::Result;
-use std::sync::Arc;
+use std::{fs, sync::Arc};
 
+use chrono::Utc;
 use datafusion::prelude::*;
 use object_store::ObjectStore;
 use url::Url;
@@ -26,26 +27,59 @@ pub mod zip;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // the object store is used to read the parquet files (in this case, it is
-    // a local file system, but in a real system it could be S3, GCS, etc)
-    let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+    let table_names = [
+        "customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier",
+    ];
+    let queries: Vec<String> = (1..=22)
+        .map(|q_num| {
+            fs::read_to_string(format!("queries/q{}.sql", q_num)).expect("Couldn't open query file")
+        })
+        .collect();
+    let tests = ["a", "q"];
+    for test in tests {
+        let ctx = SessionContext::new();
+        // the object store is used to read the parquet files (in this case, it is
+        // a local file system, but in a real system it could be S3, GCS, etc)
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::local::LocalFileSystem::new());
 
-    // Create a custom table provider with our special index.
-    let provider = Arc::new(zip::ZippedTableProvider::try_new(
-        Arc::clone(&object_store),
-        vec!["data/split/t1.parquet", "data/split/t2.parquet"],
-    )?);
+        for table_name in table_names {
+            // Create a custom table provider with our special index.
+            if test == "a" {
+                ctx.register_parquet(
+                    table_name,
+                    format!("data/tpch/{}_sf10_a0.parquet", table_name),
+                    ParquetReadOptions::new(),
+                )
+                .await?;
+            } else {
+                let provider = Arc::new(zip::ZippedTableProvider::try_new(
+                    Arc::clone(&object_store),
+                    vec![
+                        format!("data/tpch/{}_sf10_q0.parquet", table_name),
+                        format!("data/tpch/{}_sf10_q1.parquet", table_name),
+                    ],
+                )?);
+                ctx.register_table(table_name, Arc::clone(&provider) as _)?;
+            }
+        }
 
-    let ctx = SessionContext::new();
-    ctx.register_table("zip_table", Arc::clone(&provider) as _)?;
+        // register object store provider for urls like `file://` work
+        let url = Url::try_from("file://").unwrap();
+        ctx.register_object_store(&url, object_store);
 
-    // register object store provider for urls like `file://` work
-    let url = Url::try_from("file://").unwrap();
-    ctx.register_object_store(&url, object_store);
-
-    let df = ctx
-        .sql("SELECT a, b FROM zip_table WHERE a = 100 OR b = 100000")
-        .await?;
-    df.show().await?;
+        for (i, q) in queries.iter().take(1).enumerate() {
+            let start = Utc::now();
+            let df = ctx.sql(q).await?;
+            df.collect().await?;
+            let end = Utc::now();
+            println!(
+                "Test {}, Q{}: took {}ms",
+                test,
+                i + 1,
+                (end - start).num_milliseconds()
+            );
+        }
+    }
     Ok(())
 }

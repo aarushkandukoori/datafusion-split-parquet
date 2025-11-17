@@ -262,13 +262,11 @@ impl TableProvider for ZippedTableProvider {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut file_scan_configs: Vec<FileScanConfig> = vec![];
-        println!("projection = {:?}", projection);
         // Every Parquet Scan needs to use the same access plan
         // so we can stitch entire row groups back together in the right order
         let predicate = self.filters_to_predicate(state, filters)?;
         // Figure out which row groups to scan based on the predicate
         let access_plan = self.create_plan(&predicate)?;
-        println!("access_plan = {:?}", access_plan);
         for zipped_file in &self.zipped_files {
             let partitioned_file = zipped_file
                 .partitioned_file()
@@ -313,7 +311,6 @@ impl TableProvider for ZippedTableProvider {
             }
         }
 
-        println!("we need to scan {:?}", file_scan_configs);
         let mut files_to_scan = file_scan_configs.iter();
         let mut exec_plan: Arc<dyn ExecutionPlan> =
             match (files_to_scan.next(), files_to_scan.next()) {
