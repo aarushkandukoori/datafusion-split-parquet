@@ -17,22 +17,24 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::fs::File;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::task::{Context, Poll};
 
 use datafusion::catalog::Session;
 use datafusion::common::{DFSchema, DataFusionError, Result, internal_datafusion_err};
+use datafusion::config::{ParquetOptions, TableParquetOptions};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{ParquetAccessPlan, RowGroupAccessPlanFilter};
 use datafusion::datasource::physical_plan::{
-    FileMeta, FileScanConfig, FileScanConfigBuilder, ParquetFileMetrics, ParquetFileReaderFactory,
-    ParquetSource,
+    FileGroup, FileMeta, FileScanConfig, FileScanConfigBuilder, ParquetFileMetrics,
+    ParquetFileReaderFactory, ParquetSource,
 };
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
@@ -45,12 +47,14 @@ use datafusion::parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectRea
 use datafusion::parquet::file::metadata::ParquetMetaData;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::equivalence::join_equivalence_properties;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_optimizer::enforce_distribution::EnforceDistribution;
 use datafusion::physical_optimizer::pruning::build_pruning_predicate;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
 use datafusion::physical_plan::{
-    DisplayAs, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    DisplayAs, Distribution, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use datafusion::prelude::*;
 
@@ -60,6 +64,7 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::datasource::memory::DataSourceExec;
 use futures::future::BoxFuture;
+use futures::stream::Zip;
 use futures::{FutureExt, Stream, StreamExt};
 use object_store::ObjectStore;
 
@@ -71,8 +76,6 @@ pub struct ZippedTableProvider {
     schema: SchemaRef,
     /// The underlying object store
     object_store: Arc<dyn ObjectStore>,
-    /// if true, use row selections in addition to row group selections
-    use_row_selections: AtomicBool,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -97,20 +100,8 @@ impl ZippedTableProvider {
             zipped_files,
             schema,
             object_store,
-            use_row_selections: AtomicBool::new(false),
             metrics: ExecutionPlanMetricsSet::new(),
         })
-    }
-
-    /// set the value of use row selections
-    pub fn set_use_row_selection(&self, use_row_selections: bool) {
-        self.use_row_selections
-            .store(use_row_selections, Ordering::SeqCst);
-    }
-
-    /// return the value of use row selections
-    pub fn use_row_selections(&self) -> bool {
-        self.use_row_selections.load(Ordering::SeqCst)
     }
 
     /// convert filters like `a = 1`, `b = 2`
@@ -204,10 +195,7 @@ impl ZippedFile {
             DataFusionError::from(e).context(format!("Error opening file {path:?}"))
         })?;
 
-        let options = ArrowReaderOptions::new()
-            // Load the page index when reading metadata to cache
-            // so it is available to interpret row selections
-            .with_page_index(true);
+        let options = ArrowReaderOptions::new();
         let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options)?;
         let metadata = reader.metadata().clone();
         let schema = reader.schema().clone();
@@ -281,8 +269,14 @@ impl TableProvider for ZippedTableProvider {
                 CachedParquetFileReaderFactory::new(Arc::clone(&self.object_store))
                     .with_file(zipped_file);
 
+            let table_parquet_options = TableParquetOptions {
+                global: ParquetOptions {
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
             let file_source = Arc::new(
-                ParquetSource::default()
+                ParquetSource::new(table_parquet_options)
                     // provide the factory to create parquet reader without re-reading metadata
                     .with_parquet_file_reader_factory(Arc::new(reader_factory)),
                 // We do not attach a predicate here, as all of our predicate
@@ -305,7 +299,7 @@ impl TableProvider for ZippedTableProvider {
                     FileScanConfigBuilder::new(object_store_url, schema, file_source)
                         .with_limit(limit)
                         .with_projection(file_projection)
-                        .with_file(partitioned_file)
+                        .with_file_group(FileGroup::new(vec![partitioned_file]))
                         .build();
                 file_scan_configs.push(file_scan_config);
             }
@@ -322,7 +316,6 @@ impl TableProvider for ZippedTableProvider {
                 (None, Some(right)) => DataSourceExec::from_data_source(right.clone()),
                 (None, None) => Arc::new(EmptyExec::new(self.schema.clone())),
             };
-
         while let Some(file_scan) = files_to_scan.next() {
             let new_file_scan_op = DataSourceExec::from_data_source(file_scan.clone());
             exec_plan = Arc::new(ZipExec::try_new(exec_plan, new_file_scan_op)?);
@@ -457,7 +450,34 @@ pub struct ZipExec {
     schema: SchemaRef,
     left_input: Arc<dyn ExecutionPlan>,
     right_input: Arc<dyn ExecutionPlan>,
+    left_metrics: ZipMetrics,
+    right_metrics: ZipMetrics,
     cache: PlanProperties,
+}
+
+#[derive(Debug)]
+pub struct ZipMetrics {
+    num_rows_seen: usize,
+    num_batches_seen: usize,
+}
+
+impl ZipMetrics {
+    fn new() -> Self {
+        Self {
+            num_rows_seen: 0,
+            num_batches_seen: 0,
+        }
+    }
+}
+
+impl Display for ZipMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let num_rows_seen = self.num_rows_seen;
+        let num_batches_seen = self.num_batches_seen;
+        let output =
+            format!("{{num_rows_seen={num_rows_seen}, num_batches_seen={num_batches_seen}}}");
+        write!(f, "{}", output)
+    }
 }
 
 /// Copy of private function used to calculate boundedness of JOIN children
@@ -503,10 +523,14 @@ impl ZipExec {
             Arc::unwrap_or_clone(right_input.schema().clone()),
         ])?);
         let cache = Self::compute_properties(&left_input, &right_input, schema.clone())?;
+        let left_metrics = ZipMetrics::new();
+        let right_metrics = ZipMetrics::new();
         Ok(Self {
             schema,
             left_input,
             right_input,
+            left_metrics,
+            right_metrics,
             cache,
         })
     }
@@ -532,7 +556,6 @@ impl ZipExec {
 
         // Get output partitioning:
         let output_partitioning = left.output_partitioning();
-
         Ok(PlanProperties::new(
             eq_properties,
             output_partitioning.clone(),
@@ -548,7 +571,11 @@ impl DisplayAs for ZipExec {
         _t: datafusion::physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        write!(f, "ZipExec()")
+        write!(
+            f,
+            "ZipExec(left_metrics={}, right_metrics={})",
+            self.left_metrics, self.right_metrics
+        )
     }
 }
 
@@ -569,6 +596,10 @@ impl ExecutionPlan for ZipExec {
     fn maintains_input_order(&self) -> Vec<bool> {
         // Tell optimizer this operator doesn't reorder its input
         vec![true, true]
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::SinglePartition, Distribution::SinglePartition]
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -602,8 +633,7 @@ impl ExecutionPlan for ZipExec {
 
 pub struct ZipStream {
     schema: SchemaRef,
-    left_input: SendableRecordBatchStream,
-    right_input: SendableRecordBatchStream,
+    zip_stream: Zip<SendableRecordBatchStream, SendableRecordBatchStream>,
 }
 
 impl ZipStream {
@@ -612,29 +642,26 @@ impl ZipStream {
         left_input: SendableRecordBatchStream,
         right_input: SendableRecordBatchStream,
     ) -> Self {
-        Self {
-            schema,
-            left_input,
-            right_input,
-        }
+        let zip_stream = left_input.zip(right_input);
+        Self { schema, zip_stream }
     }
 
-    fn batch_zip(
-        &self,
-        left_batch: &RecordBatch,
-        right_batch: &RecordBatch,
-    ) -> Result<RecordBatch> {
+    fn batch_zip(left_batch: &RecordBatch, right_batch: &RecordBatch) -> Result<RecordBatch> {
         let schema = SchemaRef::from(Schema::try_merge([
             Arc::unwrap_or_clone(left_batch.schema()),
             Arc::unwrap_or_clone(right_batch.schema()),
         ])?);
-        let new_batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            [left_batch.columns(), right_batch.columns()]
-                .concat()
-                .to_vec(),
-        )
-        .map_err(Into::into);
+        let new_batch = if left_batch.num_rows() != right_batch.num_rows() {
+            Ok(RecordBatch::new_empty(schema))
+        } else {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                [left_batch.columns(), right_batch.columns()]
+                    .concat()
+                    .to_vec(),
+            )
+            .map_err(Into::into)
+        };
         new_batch
     }
 }
@@ -649,25 +676,20 @@ impl Stream for ZipStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let poll = match (
-            self.left_input.poll_next_unpin(cx),
-            self.right_input.poll_next_unpin(cx),
-        ) {
-            (Poll::Ready(Some(Ok(left_batch))), Poll::Ready(Some(Ok(right_batch)))) => {
-                Poll::Ready(Some(self.batch_zip(&left_batch, &right_batch)))
+        let poll = match self.zip_stream.poll_next_unpin(cx) {
+            Poll::Ready(Some((Ok(left_batch), Ok(right_batch)))) => {
+                Poll::Ready(Some(Self::batch_zip(&left_batch, &right_batch)))
             }
-            (Poll::Ready(Some(Ok(_left_batch))), Poll::Ready(None)) => Poll::Ready(None),
-            (Poll::Ready(None), Poll::Ready(Some(Ok(_right_batch)))) => Poll::Ready(None),
-            (Poll::Ready(Some(Err(e))), _) => Poll::Ready(Some(Err(e))),
-            (_, Poll::Ready(Some(Err(e)))) => Poll::Ready(Some(Err(e))),
-            (Poll::Ready(None), Poll::Ready(None)) => Poll::Ready(None),
-            (_l_other, _r_other) => Poll::Pending,
+            Poll::Ready(Some((Err(e), _))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(Some((_, Err(e)))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(None) => Poll::Ready(None),
+            other => Poll::Pending,
         };
         poll
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         // Same number of record batches
-        self.left_input.size_hint()
+        self.zip_stream.size_hint()
     }
 }

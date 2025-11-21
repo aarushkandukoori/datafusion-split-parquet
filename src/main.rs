@@ -15,7 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion::common::Result;
+use datafusion::{
+    common::{Result, file_options::parquet_writer::ParquetWriterOptions},
+    config::ParquetOptions,
+    dataframe::DataFrameWriteOptions,
+};
 use std::{fs, sync::Arc};
 
 use chrono::Utc;
@@ -27,6 +31,7 @@ pub mod zip;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let dump_results = true;
     let table_names = [
         "customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier",
     ];
@@ -37,7 +42,9 @@ async fn main() -> Result<()> {
         .collect();
     let tests = ["a", "q"];
     for test in tests {
-        let ctx = SessionContext::new();
+        let session_cfg =
+            SessionConfig::new().set_str("datafusion.optimizer.repartition_file_scans", "false");
+        let ctx = SessionContext::new_with_config(session_cfg);
         // the object store is used to read the parquet files (in this case, it is
         // a local file system, but in a real system it could be S3, GCS, etc)
         let object_store: Arc<dyn ObjectStore> =
@@ -68,13 +75,25 @@ async fn main() -> Result<()> {
         let url = Url::try_from("file://").unwrap();
         ctx.register_object_store(&url, object_store);
 
-        for (i, q) in queries.iter().take(1).enumerate() {
+        for (i, q) in queries.iter().take(3).enumerate() {
+            println!("Starting Test {}, Q{}...", test, i + 1);
             let start = Utc::now();
             let df = ctx.sql(q).await?;
-            df.collect().await?;
+            if dump_results {
+                df.clone()
+                    .write_parquet(
+                        &format!("results/result_t{}_q{}.parquet", test, i + 1),
+                        DataFrameWriteOptions::new(),
+                        None,
+                    )
+                    .await?;
+                //df.explain(false, false)?.show().await?;
+            } else {
+                df.collect().await?;
+            }
             let end = Utc::now();
             println!(
-                "Test {}, Q{}: took {}ms",
+                "Finished Test {}, Q{}: took {}ms",
                 test,
                 i + 1,
                 (end - start).num_milliseconds()
