@@ -29,12 +29,9 @@ use url::Url;
 
 pub mod zip;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+async fn tpch() -> Result<()> {
     let dump_results = true;
-    let table_names = [
-        "customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier",
-    ];
+    let table_names = ["lineitem"];
     let queries: Vec<String> = (1..=22)
         .map(|q_num| {
             fs::read_to_string(format!("queries/q{}.sql", q_num)).expect("Couldn't open query file")
@@ -43,7 +40,7 @@ async fn main() -> Result<()> {
     let tests = ["a", "q"];
     for test in tests {
         let session_cfg =
-            SessionConfig::new().set_str("datafusion.optimizer.repartition_file_scans", "false");
+            SessionConfig::new().set_str("datafusion.optimizer.repartition_file_scans", "true");
         let ctx = SessionContext::new_with_config(session_cfg);
         // the object store is used to read the parquet files (in this case, it is
         // a local file system, but in a real system it could be S3, GCS, etc)
@@ -75,7 +72,7 @@ async fn main() -> Result<()> {
         let url = Url::try_from("file://").unwrap();
         ctx.register_object_store(&url, object_store);
 
-        for (i, q) in queries.iter().take(3).enumerate() {
+        for (i, q) in queries.iter().take(1).enumerate() {
             println!("Starting Test {}, Q{}...", test, i + 1);
             let start = Utc::now();
             let df = ctx.sql(q).await?;
@@ -87,7 +84,7 @@ async fn main() -> Result<()> {
                         None,
                     )
                     .await?;
-                //df.explain(false, false)?.show().await?;
+                df.explain(false, false)?.show().await?;
             } else {
                 df.collect().await?;
             }
@@ -101,4 +98,60 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn smoke() -> Result<()> {
+    let session_cfg =
+        SessionConfig::new().set_str("datafusion.optimizer.repartition_file_scans", "true");
+    let ctx = SessionContext::new_with_config(session_cfg);
+    // the object store is used to read the parquet files (in this case, it is
+    // a local file system, but in a real system it could be S3, GCS, etc)
+    let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+
+    ctx.register_parquet(
+        "whole_table",
+        "data/control/table.parquet",
+        ParquetReadOptions::new(),
+    )
+    .await?;
+    let provider = Arc::new(zip::ZippedTableProvider::try_new(
+        Arc::clone(&object_store),
+        vec!["data/split/t1.parquet", "data/split/t2.parquet"],
+    )?);
+    ctx.register_table("split_table", Arc::clone(&provider) as _)?;
+    // register object store provider for urls like `file://` work
+    let url = Url::try_from("file://").unwrap();
+    ctx.register_object_store(&url, object_store);
+    println!("Running smoke test for control table...");
+    let mut start = Utc::now();
+    ctx.sql("SELECT * FROM whole_table")
+        .await?
+        .collect()
+        .await?;
+    let mut end = Utc::now();
+    println!(
+        "Finished smoke test for control table: took {}ms",
+        (end - start).num_milliseconds()
+    );
+
+    println!("Running smoke test for split table...");
+    start = Utc::now();
+    ctx.sql("SELECT * FROM split_table")
+        .await?
+        .explain(false, false)?
+        .show()
+        .await?;
+    end = Utc::now();
+    println!(
+        "Finished smoke test for split table: took {}ms",
+        (end - start).num_milliseconds()
+    );
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    //smoke().await
+    tpch().await
 }
