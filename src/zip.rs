@@ -23,12 +23,11 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::task::{Context, Poll};
 
 use datafusion::catalog::Session;
 use datafusion::common::{DFSchema, DataFusionError, Result, internal_datafusion_err};
-use datafusion::config::{ParquetOptions, TableParquetOptions};
+use datafusion::config::{ConfigOptions, ParquetOptions, TableParquetOptions};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{ParquetAccessPlan, RowGroupAccessPlanFilter};
@@ -47,14 +46,12 @@ use datafusion::parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectRea
 use datafusion::parquet::file::metadata::ParquetMetaData;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::equivalence::join_equivalence_properties;
-use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_optimizer::enforce_distribution::EnforceDistribution;
 use datafusion::physical_optimizer::pruning::build_pruning_predicate;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
 use datafusion::physical_plan::{
-    DisplayAs, Distribution, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    DisplayAs, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use datafusion::prelude::*;
 
@@ -176,6 +173,8 @@ struct ZippedFile {
     metadata: Arc<ParquetMetaData>,
     /// The arrow schema of the file
     schema: SchemaRef,
+    /// List of sizes in bytes of each row group sequentially (offset, size)
+    row_group_sizes: Vec<(i64, i64)>,
 }
 
 impl ZippedFile {
@@ -199,7 +198,11 @@ impl ZippedFile {
         let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options)?;
         let metadata = reader.metadata().clone();
         let schema = reader.schema().clone();
-
+        let row_group_sizes: Vec<(i64, i64)> = metadata
+            .row_groups()
+            .iter()
+            .map(|rgm| (rgm.file_offset().unwrap(), rgm.compressed_size()))
+            .collect();
         // canonicalize after writing the file
         let path = std::fs::canonicalize(path)?;
 
@@ -209,6 +212,7 @@ impl ZippedFile {
             file_size,
             metadata,
             schema,
+            row_group_sizes,
         })
     }
 
@@ -218,6 +222,40 @@ impl ZippedFile {
     /// its extensions.
     fn partitioned_file(&self) -> PartitionedFile {
         PartitionedFile::new(self.path.display().to_string(), self.file_size)
+    }
+
+    fn file_group_from_row_group_sizes(
+        &self,
+        partitions: usize,
+        access_plan: ParquetAccessPlan,
+    ) -> Vec<FileGroup> {
+        let path = self.path.display().to_string();
+        let mut files: Vec<FileGroup> = vec![];
+        let mut row_group_sizes = self.row_group_sizes.clone();
+        row_group_sizes.sort_by_key(|r| r.0);
+        let row_groups_per_partition = self.row_group_sizes.len() / partitions;
+        let ranges: Vec<(i64, i64)> = self
+            .row_group_sizes
+            .chunks(row_groups_per_partition)
+            .map(|c| {
+                let last = c.last().unwrap();
+                (c.first().unwrap().0, last.0 + last.1)
+            })
+            .collect();
+        let mut last_end = -1;
+        for r in ranges {
+            println!("RANGE: ({}, {})", r.0, r.1);
+            if r.0 < last_end {
+                println!("WARNING, OVERLAPPING ({} < {})", r.0, last_end);
+            }
+            last_end = r.1;
+            files.push(FileGroup::new(vec![
+                PartitionedFile::new_with_range(path.clone(), self.file_size, r.0, r.1)
+                    .with_extensions(Arc::new(access_plan.clone()) as _),
+            ]));
+        }
+
+        files
     }
 
     /// Return a `ParquetAccessPlan` that scans all row groups in the file
@@ -299,7 +337,9 @@ impl TableProvider for ZippedTableProvider {
                     FileScanConfigBuilder::new(object_store_url, schema, file_source)
                         .with_limit(limit)
                         .with_projection(file_projection)
-                        .with_file_group(FileGroup::new(vec![partitioned_file]))
+                        .with_file_groups(
+                            zipped_file.file_group_from_row_group_sizes(14, access_plan.clone()),
+                        )
                         .build();
                 file_scan_configs.push(file_scan_config);
             }
@@ -445,7 +485,7 @@ impl AsyncFileReader for ParquetReaderWithCache {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ZipExec {
     schema: SchemaRef,
     left_input: Arc<dyn ExecutionPlan>,
@@ -455,7 +495,7 @@ pub struct ZipExec {
     cache: PlanProperties,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ZipMetrics {
     num_rows_seen: usize,
     num_batches_seen: usize,
@@ -598,10 +638,6 @@ impl ExecutionPlan for ZipExec {
         vec![true, true]
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition, Distribution::SinglePartition]
-    }
-
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.left_input, &self.right_input]
     }
@@ -614,6 +650,14 @@ impl ExecutionPlan for ZipExec {
             Arc::clone(&children[0]),
             Arc::clone(&children[1]),
         )?))
+    }
+
+    fn repartitioned(
+        &self,
+        target_partitions: usize,
+        _config: &ConfigOptions,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(Some(Arc::new(self.clone())))
     }
 
     fn execute(
@@ -683,7 +727,7 @@ impl Stream for ZipStream {
             Poll::Ready(Some((Err(e), _))) => Poll::Ready(Some(Err(e))),
             Poll::Ready(Some((_, Err(e)))) => Poll::Ready(Some(Err(e))),
             Poll::Ready(None) => Poll::Ready(None),
-            other => Poll::Pending,
+            _ => Poll::Pending,
         };
         poll
     }

@@ -15,11 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion::{
-    common::{Result, file_options::parquet_writer::ParquetWriterOptions},
-    config::ParquetOptions,
-    dataframe::DataFrameWriteOptions,
-};
+use datafusion::{common::Result, dataframe::DataFrameWriteOptions};
 use std::{fs, sync::Arc};
 
 use chrono::Utc;
@@ -100,23 +96,19 @@ async fn tpch() -> Result<()> {
     Ok(())
 }
 
-async fn smoke() -> Result<()> {
+async fn smoke(control: String, partitions: Vec<String>, dump: bool) -> Result<()> {
     let session_cfg =
-        SessionConfig::new().set_str("datafusion.optimizer.repartition_file_scans", "true");
+        SessionConfig::new().set_str("datafusion.optimizer.repartition_file_scans", "false");
     let ctx = SessionContext::new_with_config(session_cfg);
     // the object store is used to read the parquet files (in this case, it is
     // a local file system, but in a real system it could be S3, GCS, etc)
     let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
 
-    ctx.register_parquet(
-        "whole_table",
-        "data/control/table.parquet",
-        ParquetReadOptions::new(),
-    )
-    .await?;
+    ctx.register_parquet("whole_table", control, ParquetReadOptions::new())
+        .await?;
     let provider = Arc::new(zip::ZippedTableProvider::try_new(
         Arc::clone(&object_store),
-        vec!["data/split/t1.parquet", "data/split/t2.parquet"],
+        partitions,
     )?);
     ctx.register_table("split_table", Arc::clone(&provider) as _)?;
     // register object store provider for urls like `file://` work
@@ -124,10 +116,21 @@ async fn smoke() -> Result<()> {
     ctx.register_object_store(&url, object_store);
     println!("Running smoke test for control table...");
     let mut start = Utc::now();
-    ctx.sql("SELECT * FROM whole_table")
-        .await?
-        .collect()
-        .await?;
+    if dump {
+        ctx.sql("SELECT * FROM whole_table")
+            .await?
+            .write_parquet(
+                "control_result.parquet",
+                DataFrameWriteOptions::default(),
+                None,
+            )
+            .await?;
+    } else {
+        ctx.sql("SELECT * FROM whole_table")
+            .await?
+            .collect()
+            .await?;
+    }
     let mut end = Utc::now();
     println!(
         "Finished smoke test for control table: took {}ms",
@@ -136,11 +139,21 @@ async fn smoke() -> Result<()> {
 
     println!("Running smoke test for split table...");
     start = Utc::now();
-    ctx.sql("SELECT * FROM split_table")
-        .await?
-        .explain(false, false)?
-        .show()
-        .await?;
+    if dump {
+        ctx.sql("SELECT * FROM split_table")
+            .await?
+            .write_parquet(
+                "split_result.parquet",
+                DataFrameWriteOptions::default(),
+                None,
+            )
+            .await?;
+    } else {
+        ctx.sql("SELECT * FROM split_table")
+            .await?
+            .collect()
+            .await?;
+    }
     end = Utc::now();
     println!(
         "Finished smoke test for split table: took {}ms",
@@ -152,6 +165,16 @@ async fn smoke() -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    //smoke().await
+    /*
+    smoke(
+        "data/tpch/lineitem_sf10_a0.parquet".into(),
+        vec![
+            "data/tpch/lineitem_sf10_q0.parquet".into(),
+            "data/tpch/lineitem_sf10_q1.parquet".into(),
+        ],
+        true,
+    )
+    .await
+    */
     tpch().await
 }
