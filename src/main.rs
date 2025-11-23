@@ -35,9 +35,7 @@ async fn tpch() -> Result<()> {
         .collect();
     let tests = ["a", "q"];
     for test in tests {
-        let session_cfg =
-            SessionConfig::new().set_str("datafusion.optimizer.repartition_file_scans", "true");
-        let ctx = SessionContext::new_with_config(session_cfg);
+        let ctx = SessionContext::new();
         // the object store is used to read the parquet files (in this case, it is
         // a local file system, but in a real system it could be S3, GCS, etc)
         let object_store: Arc<dyn ObjectStore> =
@@ -80,7 +78,7 @@ async fn tpch() -> Result<()> {
                         None,
                     )
                     .await?;
-                df.explain(false, false)?.show().await?;
+                //df.explain(false, false)?.show().await?;
             } else {
                 df.collect().await?;
             }
@@ -97,9 +95,7 @@ async fn tpch() -> Result<()> {
 }
 
 async fn smoke(control: String, partitions: Vec<String>, dump: bool) -> Result<()> {
-    let session_cfg =
-        SessionConfig::new().set_str("datafusion.optimizer.repartition_file_scans", "false");
-    let ctx = SessionContext::new_with_config(session_cfg);
+    let ctx = SessionContext::new();
     // the object store is used to read the parquet files (in this case, it is
     // a local file system, but in a real system it could be S3, GCS, etc)
     let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());

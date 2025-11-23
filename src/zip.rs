@@ -27,7 +27,7 @@ use std::task::{Context, Poll};
 
 use datafusion::catalog::Session;
 use datafusion::common::{DFSchema, DataFusionError, Result, internal_datafusion_err};
-use datafusion::config::{ConfigOptions, ParquetOptions, TableParquetOptions};
+use datafusion::config::{ParquetOptions, TableParquetOptions};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{ParquetAccessPlan, RowGroupAccessPlanFilter};
@@ -173,8 +173,38 @@ struct ZippedFile {
     metadata: Arc<ParquetMetaData>,
     /// The arrow schema of the file
     schema: SchemaRef,
-    /// List of sizes in bytes of each row group sequentially (offset, size)
-    row_group_sizes: Vec<(i64, i64)>,
+    /// (start, end) byte range for each row group
+    row_group_ranges: Vec<(i64, i64)>,
+}
+
+struct Split<'a, T> {
+    slice: &'a [T],
+    len: usize,
+    rem: usize,
+}
+
+impl<'a, T> Iterator for Split<'a, T> {
+    type Item = &'a [T];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.slice.is_empty() {
+            return None;
+        }
+        let mut len = self.len;
+        if self.rem > 0 {
+            len += 1;
+            self.rem -= 1;
+        }
+        let (chunk, rest) = self.slice.split_at(len);
+        self.slice = rest;
+        Some(chunk)
+    }
+}
+
+pub fn split<T>(slice: &[T], n: usize) -> impl Iterator<Item = &[T]> {
+    let len = slice.len() / n;
+    let rem = slice.len() % n;
+    Split { slice, len, rem }
 }
 
 impl ZippedFile {
@@ -198,10 +228,14 @@ impl ZippedFile {
         let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options)?;
         let metadata = reader.metadata().clone();
         let schema = reader.schema().clone();
-        let row_group_sizes: Vec<(i64, i64)> = metadata
+        let row_group_ranges: Vec<(i64, i64)> = metadata
             .row_groups()
             .iter()
-            .map(|rgm| (rgm.file_offset().unwrap(), rgm.compressed_size()))
+            .map(|rgm| {
+                let start = rgm.file_offset().unwrap();
+                // The compressed_size is basically the "real" size in the file
+                (start, start + rgm.compressed_size())
+            })
             .collect();
         // canonicalize after writing the file
         let path = std::fs::canonicalize(path)?;
@@ -212,55 +246,65 @@ impl ZippedFile {
             file_size,
             metadata,
             schema,
-            row_group_sizes,
+            row_group_ranges,
         })
-    }
-
-    /// Return a `PartitionedFile` to scan the underlying file
-    ///
-    /// The returned value does not have any  `ParquetAccessPlan` specified in
-    /// its extensions.
-    fn partitioned_file(&self) -> PartitionedFile {
-        PartitionedFile::new(self.path.display().to_string(), self.file_size)
-    }
-
-    fn file_group_from_row_group_sizes(
-        &self,
-        partitions: usize,
-        access_plan: ParquetAccessPlan,
-    ) -> Vec<FileGroup> {
-        let path = self.path.display().to_string();
-        let mut files: Vec<FileGroup> = vec![];
-        let mut row_group_sizes = self.row_group_sizes.clone();
-        row_group_sizes.sort_by_key(|r| r.0);
-        let row_groups_per_partition = self.row_group_sizes.len() / partitions;
-        let ranges: Vec<(i64, i64)> = self
-            .row_group_sizes
-            .chunks(row_groups_per_partition)
-            .map(|c| {
-                let last = c.last().unwrap();
-                (c.first().unwrap().0, last.0 + last.1)
-            })
-            .collect();
-        let mut last_end = -1;
-        for r in ranges {
-            println!("RANGE: ({}, {})", r.0, r.1);
-            if r.0 < last_end {
-                println!("WARNING, OVERLAPPING ({} < {})", r.0, last_end);
-            }
-            last_end = r.1;
-            files.push(FileGroup::new(vec![
-                PartitionedFile::new_with_range(path.clone(), self.file_size, r.0, r.1)
-                    .with_extensions(Arc::new(access_plan.clone()) as _),
-            ]));
-        }
-
-        files
     }
 
     /// Return a `ParquetAccessPlan` that scans all row groups in the file
     fn scan_all_plan(&self) -> ParquetAccessPlan {
         ParquetAccessPlan::new_all(self.metadata.num_row_groups())
+    }
+}
+
+pub fn partition_file(
+    path: String,
+    file_size: u64,
+    row_group_ranges: Vec<(i64, i64)>,
+    partitions: usize,
+    access_plan: ParquetAccessPlan,
+) -> Vec<FileGroup> {
+    let mut files: Vec<FileGroup> = vec![];
+    let mut row_group_ranges = row_group_ranges.clone();
+    // Sort them by their starting offset
+    row_group_ranges.sort_by_key(|r| r.0);
+    let ranges: Vec<(i64, i64)> = split(row_group_ranges.as_slice(), partitions)
+        .map(|c| {
+            // (offset of first row group, end of last row group)
+            (c.first().unwrap().0, c.last().unwrap().1)
+        })
+        .collect();
+
+    for r in ranges {
+        files.push(FileGroup::new(vec![
+            PartitionedFile::new_with_range(path.clone(), file_size, r.0, r.1)
+                .with_extensions(Arc::new(access_plan.clone()) as _),
+        ]));
+    }
+
+    files
+}
+
+#[derive(Debug, Clone)]
+pub struct ZipPartitionInfo {
+    path: String,
+    file_size: u64,
+    access_plan: ParquetAccessPlan,
+    row_group_ranges: Vec<(i64, i64)>,
+}
+
+impl ZipPartitionInfo {
+    fn new(
+        path: String,
+        file_size: u64,
+        access_plan: ParquetAccessPlan,
+        row_group_ranges: Vec<(i64, i64)>,
+    ) -> Self {
+        Self {
+            path,
+            file_size,
+            access_plan,
+            row_group_ranges,
+        }
     }
 }
 
@@ -287,17 +331,14 @@ impl TableProvider for ZippedTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let mut file_scan_configs: Vec<FileScanConfig> = vec![];
+        let target_partitions = state.config().target_partitions();
+        let mut file_scans: Vec<(FileScanConfig, ZipPartitionInfo)> = vec![];
         // Every Parquet Scan needs to use the same access plan
         // so we can stitch entire row groups back together in the right order
         let predicate = self.filters_to_predicate(state, filters)?;
         // Figure out which row groups to scan based on the predicate
         let access_plan = self.create_plan(&predicate)?;
         for zipped_file in &self.zipped_files {
-            let partitioned_file = zipped_file
-                .partitioned_file()
-                .with_extensions(Arc::new(access_plan.clone()) as _);
-
             // Prepare for scanning
             let schema = zipped_file.schema.clone();
             let object_store_url = ObjectStoreUrl::parse("file://")?;
@@ -333,32 +374,49 @@ impl TableProvider for ZippedTableProvider {
             // We need to scan this file if the projection is None, or if there is a column in the
             // projection vector that is in this file
             if file_projection.clone().map(|proj| proj.len()).unwrap_or(1) > 0 {
+                let zip_partition_info = ZipPartitionInfo::new(
+                    zipped_file.path.display().to_string(),
+                    zipped_file.file_size,
+                    access_plan.clone(),
+                    zipped_file.row_group_ranges.clone(),
+                );
                 let file_scan_config =
                     FileScanConfigBuilder::new(object_store_url, schema, file_source)
                         .with_limit(limit)
                         .with_projection(file_projection)
-                        .with_file_groups(
-                            zipped_file.file_group_from_row_group_sizes(14, access_plan.clone()),
-                        )
+                        .with_file_groups(partition_file(
+                            zip_partition_info.path.clone(),
+                            zip_partition_info.file_size,
+                            zip_partition_info.row_group_ranges.clone(),
+                            target_partitions,
+                            zip_partition_info.access_plan.clone(),
+                        ))
                         .build();
-                file_scan_configs.push(file_scan_config);
+                file_scans.push((file_scan_config, zip_partition_info));
             }
         }
 
-        let mut files_to_scan = file_scan_configs.iter();
+        let mut files_to_scan = file_scans.iter();
         let mut exec_plan: Arc<dyn ExecutionPlan> =
             match (files_to_scan.next(), files_to_scan.next()) {
                 (Some(left), Some(right)) => Arc::new(ZipExec::try_new(
-                    DataSourceExec::from_data_source(left.clone()),
-                    DataSourceExec::from_data_source(right.clone()),
+                    DataSourceExec::from_data_source(left.0.clone()),
+                    DataSourceExec::from_data_source(right.0.clone()),
+                    Some(Arc::new(left.1.clone())),
+                    Some(Arc::new(right.1.clone())),
                 )?),
-                (Some(left), None) => DataSourceExec::from_data_source(left.clone()),
-                (None, Some(right)) => DataSourceExec::from_data_source(right.clone()),
+                (Some(left), None) => DataSourceExec::from_data_source(left.0.clone()),
+                (None, Some(right)) => DataSourceExec::from_data_source(right.0.clone()),
                 (None, None) => Arc::new(EmptyExec::new(self.schema.clone())),
             };
         while let Some(file_scan) = files_to_scan.next() {
-            let new_file_scan_op = DataSourceExec::from_data_source(file_scan.clone());
-            exec_plan = Arc::new(ZipExec::try_new(exec_plan, new_file_scan_op)?);
+            let new_file_scan_op = DataSourceExec::from_data_source(file_scan.0.clone());
+            exec_plan = Arc::new(ZipExec::try_new(
+                exec_plan,
+                new_file_scan_op,
+                None,
+                Some(Arc::new(file_scan.1.clone())),
+            )?);
         }
         // Finally, put it all together into a DataSourceExec
         Ok(exec_plan)
@@ -490,6 +548,8 @@ pub struct ZipExec {
     schema: SchemaRef,
     left_input: Arc<dyn ExecutionPlan>,
     right_input: Arc<dyn ExecutionPlan>,
+    left_info: Option<Arc<ZipPartitionInfo>>,
+    right_info: Option<Arc<ZipPartitionInfo>>,
     left_metrics: ZipMetrics,
     right_metrics: ZipMetrics,
     cache: PlanProperties,
@@ -557,6 +617,8 @@ impl ZipExec {
     pub fn try_new(
         left_input: Arc<dyn ExecutionPlan>,
         right_input: Arc<dyn ExecutionPlan>,
+        left_info: Option<Arc<ZipPartitionInfo>>,
+        right_info: Option<Arc<ZipPartitionInfo>>,
     ) -> Result<Self> {
         let schema = SchemaRef::from(Schema::try_merge(vec![
             Arc::unwrap_or_clone(left_input.schema().clone()),
@@ -569,6 +631,8 @@ impl ZipExec {
             schema,
             left_input,
             right_input,
+            left_info,
+            right_info,
             left_metrics,
             right_metrics,
             cache,
@@ -581,9 +645,6 @@ impl ZipExec {
         right: &Arc<dyn ExecutionPlan>,
         schema: SchemaRef,
     ) -> Result<PlanProperties> {
-        // Calculate equivalence properties
-        // TODO: Check equivalence properties of cross join, it may preserve
-        //       ordering in some cases.
         let eq_properties = join_equivalence_properties(
             left.equivalence_properties().clone(),
             right.equivalence_properties().clone(),
@@ -649,15 +710,9 @@ impl ExecutionPlan for ZipExec {
         Ok(Arc::new(ZipExec::try_new(
             Arc::clone(&children[0]),
             Arc::clone(&children[1]),
+            self.left_info.clone(),
+            self.right_info.clone(),
         )?))
-    }
-
-    fn repartitioned(
-        &self,
-        target_partitions: usize,
-        _config: &ConfigOptions,
-    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        Ok(Some(Arc::new(self.clone())))
     }
 
     fn execute(
