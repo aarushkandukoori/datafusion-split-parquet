@@ -15,7 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion::{common::Result, dataframe::DataFrameWriteOptions};
+use datafusion::{
+    arrow::array::{Int64Array, StringArray, UInt32Array, UInt64Array},
+    common::Result,
+    dataframe::DataFrameWriteOptions,
+};
 use std::{fs, sync::Arc};
 
 use chrono::Utc;
@@ -25,15 +29,36 @@ use url::Url;
 
 pub mod zip;
 
-async fn tpch() -> Result<()> {
-    let dump_results = true;
-    let table_names = ["lineitem"];
+pub struct TestResult {
+    test: String,
+    query: usize,
+    trial: u32,
+    runtime: i64,
+}
+
+impl TestResult {
+    fn new(test: String, query: usize, trial: u32, runtime: i64) -> Self {
+        Self {
+            test,
+            query,
+            trial,
+            runtime,
+        }
+    }
+}
+
+async fn tpch(trials: usize) -> Result<Vec<TestResult>> {
+    let mut results = Vec::new();
+    let dump_results = false;
+    let table_names = [
+        "lineitem", "orders", "partsupp", "supplier", "nation", "region", "part", "customer",
+    ];
     let queries: Vec<String> = (1..=22)
         .map(|q_num| {
             fs::read_to_string(format!("queries/q{}.sql", q_num)).expect("Couldn't open query file")
         })
         .collect();
-    let tests = ["a", "q"];
+    let tests = ["a", "b", "c"];
     for test in tests {
         let ctx = SessionContext::new();
         // the object store is used to read the parquet files (in this case, it is
@@ -44,18 +69,29 @@ async fn tpch() -> Result<()> {
         for table_name in table_names {
             // Create a custom table provider with our special index.
             if test == "a" {
+                let parquet_options = ParquetReadOptions::default().parquet_pruning(true);
                 ctx.register_parquet(
                     table_name,
-                    format!("data/tpch/{}_sf10_a0.parquet", table_name),
-                    ParquetReadOptions::new(),
+                    format!("data/tpch/{}_a0.parquet", table_name),
+                    parquet_options,
                 )
                 .await?;
-            } else {
+            } else if test == "b" {
                 let provider = Arc::new(zip::ZippedTableProvider::try_new(
                     Arc::clone(&object_store),
                     vec![
-                        format!("data/tpch/{}_sf10_q0.parquet", table_name),
-                        format!("data/tpch/{}_sf10_q1.parquet", table_name),
+                        format!("data/tpch/{}_b0.parquet", table_name),
+                        format!("data/tpch/{}_b1.parquet", table_name),
+                    ],
+                )?);
+                ctx.register_table(table_name, Arc::clone(&provider) as _)?;
+            } else if test == "c" {
+                let provider = Arc::new(zip::ZippedTableProvider::try_new(
+                    Arc::clone(&object_store),
+                    vec![
+                        format!("data/tpch/{}_c0.parquet", table_name),
+                        format!("data/tpch/{}_c1.parquet", table_name),
+                        format!("data/tpch/{}_c2.parquet", table_name),
                     ],
                 )?);
                 ctx.register_table(table_name, Arc::clone(&provider) as _)?;
@@ -66,32 +102,40 @@ async fn tpch() -> Result<()> {
         let url = Url::try_from("file://").unwrap();
         ctx.register_object_store(&url, object_store);
 
-        for (i, q) in queries.iter().take(1).enumerate() {
-            println!("Starting Test {}, Q{}...", test, i + 1);
-            let start = Utc::now();
-            let df = ctx.sql(q).await?;
-            if dump_results {
-                df.clone()
-                    .write_parquet(
-                        &format!("results/result_t{}_q{}.parquet", test, i + 1),
-                        DataFrameWriteOptions::new(),
-                        None,
-                    )
-                    .await?;
-                //df.explain(false, false)?.show().await?;
-            } else {
-                df.collect().await?;
+        for t in 0..trials as u32 {
+            for (i, q) in queries.iter().enumerate() {
+                println!("Starting Test {}, Q{} (#{})...", test, i + 1, t + 1);
+                let start = Utc::now();
+                for (seg, query_segment) in q
+                    .split(";")
+                    .filter(|s| s.split_whitespace().collect::<String>() != "")
+                    .enumerate()
+                {
+                    let df = ctx.sql(query_segment).await?;
+                    if dump_results {
+                        df.clone()
+                            .write_parquet(
+                                &format!("results/result_t{}_q{}_seg{}.parquet", test, i + 1, seg),
+                                DataFrameWriteOptions::new(),
+                                None,
+                            )
+                            .await?;
+                        //df.explain(false, false)?.show().await?;
+                    } else {
+                        df.clone().collect().await?;
+                        println!("Explain:");
+                        df.explain(true, true)?.show().await?;
+                    }
+                }
+                let end = Utc::now();
+                let runtime = (end - start).num_milliseconds();
+                println!("Finished Test {}, Q{}: took {}ms", test, i + 1, runtime);
+                let point = TestResult::new(test.into(), i + 1, t, runtime);
+                results.push(point);
             }
-            let end = Utc::now();
-            println!(
-                "Finished Test {}, Q{}: took {}ms",
-                test,
-                i + 1,
-                (end - start).num_milliseconds()
-            );
         }
     }
-    Ok(())
+    Ok(results)
 }
 
 async fn smoke(control: String, partitions: Vec<String>, dump: bool) -> Result<()> {
@@ -151,12 +195,35 @@ async fn smoke(control: String, partitions: Vec<String>, dump: bool) -> Result<(
             .await?;
     }
     end = Utc::now();
-    println!(
-        "Finished smoke test for split table: took {}ms",
-        (end - start).num_milliseconds()
-    );
+    let runtime = (end - start).num_milliseconds();
+    println!("Finished smoke test for split table: took {}ms", runtime);
 
     Ok(())
+}
+
+fn results_to_df(results: Vec<TestResult>) -> DataFrame {
+    let tests = Arc::new(StringArray::from(
+        results
+            .iter()
+            .map(|r| r.test.clone())
+            .collect::<Vec<String>>(),
+    ));
+    let queries = Arc::new(UInt64Array::from(
+        results.iter().map(|r| r.query as u64).collect::<Vec<u64>>(),
+    ));
+    let trials = Arc::new(UInt32Array::from(
+        results.iter().map(|r| r.trial).collect::<Vec<u32>>(),
+    ));
+    let runtimes = Arc::new(Int64Array::from(
+        results.iter().map(|r| r.runtime).collect::<Vec<i64>>(),
+    ));
+    DataFrame::from_columns(vec![
+        ("test", tests),
+        ("query", queries),
+        ("trial", trials),
+        ("runtime", runtimes),
+    ])
+    .expect("Couldn't pack results arrays into DataFrame")
 }
 
 #[tokio::main]
@@ -172,5 +239,9 @@ async fn main() -> Result<()> {
     )
     .await
     */
-    tpch().await
+    let results = tpch(1).await?;
+    let df = results_to_df(results);
+    df.write_csv("test-data.csv", DataFrameWriteOptions::default(), None)
+        .await?;
+    Ok(())
 }
