@@ -348,14 +348,9 @@ impl TableProvider for ZippedTableProvider {
                 CachedParquetFileReaderFactory::new(Arc::clone(&self.object_store))
                     .with_file(zipped_file);
 
-            let table_parquet_options = TableParquetOptions {
-                global: ParquetOptions {
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
             let file_source = Arc::new(
-                ParquetSource::new(table_parquet_options)
+                ParquetSource::default()
+                    .with_bloom_filter_on_read(true)
                     // provide the factory to create parquet reader without re-reading metadata
                     .with_parquet_file_reader_factory(Arc::new(reader_factory)),
                 // We do not attach a predicate here, as all of our predicate
@@ -498,6 +493,7 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
             filename,
             metadata: Arc::clone(metadata),
             inner,
+            call_count: 0,
         }))
     }
 }
@@ -507,6 +503,7 @@ struct ParquetReaderWithCache {
     filename: String,
     metadata: Arc<ParquetMetaData>,
     inner: ParquetObjectReader,
+    call_count: i32,
 }
 
 impl AsyncFileReader for ParquetReaderWithCache {
@@ -515,6 +512,7 @@ impl AsyncFileReader for ParquetReaderWithCache {
         range: Range<u64>,
     ) -> BoxFuture<'_, datafusion::parquet::errors::Result<Bytes>> {
         //println!("get_bytes: {} Reading range {:?}", self.filename, range);
+        self.call_count += 1;
         self.inner.get_bytes(range)
     }
 
@@ -528,6 +526,7 @@ impl AsyncFileReader for ParquetReaderWithCache {
             self.filename, ranges
         );
         */
+        self.call_count += 1;
         self.inner.get_byte_ranges(ranges)
     }
 

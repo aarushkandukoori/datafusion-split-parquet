@@ -20,7 +20,7 @@ use datafusion::{
     common::Result,
     dataframe::DataFrameWriteOptions,
 };
-use std::{fs, sync::Arc};
+use std::{collections::HashSet, fs, sync::Arc};
 
 use chrono::Utc;
 use datafusion::prelude::*;
@@ -47,7 +47,8 @@ impl TestResult {
     }
 }
 
-async fn tpch(trials: usize) -> Result<Vec<TestResult>> {
+async fn tpch(trials: usize, queries: Option<Vec<usize>>) -> Result<Vec<TestResult>> {
+    let subset_queries = queries.map(|q| HashSet::from_iter(q));
     let mut results = Vec::new();
     let dump_results = false;
     let table_names = [
@@ -103,7 +104,12 @@ async fn tpch(trials: usize) -> Result<Vec<TestResult>> {
         ctx.register_object_store(&url, object_store);
 
         for t in 0..trials as u32 {
-            for (i, q) in queries.iter().enumerate() {
+            for (i, q) in queries.iter().enumerate().filter(|p| {
+                subset_queries
+                    .as_ref()
+                    .map(|hs: &HashSet<usize>| hs.contains(&(p.0 + 1)))
+                    .unwrap_or(true)
+            }) {
                 println!("Starting Test {}, Q{} (#{})...", test, i + 1, t + 1);
                 let start = Utc::now();
                 for (seg, query_segment) in q
@@ -123,8 +129,8 @@ async fn tpch(trials: usize) -> Result<Vec<TestResult>> {
                         //df.explain(false, false)?.show().await?;
                     } else {
                         df.clone().collect().await?;
-                        println!("Explain:");
-                        df.explain(true, true)?.show().await?;
+                        //println!("Explain:");
+                        //df.explain(true, true)?.show().await?;
                     }
                 }
                 let end = Utc::now();
@@ -239,7 +245,7 @@ async fn main() -> Result<()> {
     )
     .await
     */
-    let results = tpch(1).await?;
+    let results = tpch(5, None).await?;
     let df = results_to_df(results);
     df.write_csv("test-data.csv", DataFrameWriteOptions::default(), None)
         .await?;
