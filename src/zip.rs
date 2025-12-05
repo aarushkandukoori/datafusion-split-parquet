@@ -17,7 +17,7 @@
 
 use datafusion::physical_plan::metrics::MetricsSet;
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -62,8 +62,8 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::datasource::memory::DataSourceExec;
 use futures::future::BoxFuture;
-use futures::stream::{StreamFuture, Zip};
-use futures::{FutureExt, Stream, StreamExt, stream::Buffered};
+use futures::stream::Zip;
+use futures::{FutureExt, Stream, StreamExt};
 use object_store::ObjectStore;
 
 #[derive(Debug)]
@@ -755,27 +755,36 @@ impl ExecutionPlan for ZipExec {
             left_stream,
             right_stream,
             zip_metrics,
+            16,
         )))
     }
 }
 
 pub struct ZipStream {
     schema: SchemaRef,
-    zip_stream: Zip<SendableRecordBatchStream, SendableRecordBatchStream>,
+    left_stream: SendableRecordBatchStream,
+    right_stream: SendableRecordBatchStream,
+    left_buffer: VecDeque<RecordBatch>,
+    right_buffer: VecDeque<RecordBatch>,
     metrics: ZipMetrics,
 }
 
 impl ZipStream {
     fn new(
         schema: SchemaRef,
-        left_input: SendableRecordBatchStream,
-        right_input: SendableRecordBatchStream,
+        left_stream: SendableRecordBatchStream,
+        right_stream: SendableRecordBatchStream,
         metrics: ZipMetrics,
+        buffer_len: usize,
     ) -> Self {
-        let zip_stream = left_input.zip(right_input);
+        let left_buffer = VecDeque::with_capacity(buffer_len);
+        let right_buffer = VecDeque::with_capacity(buffer_len);
         Self {
             schema,
-            zip_stream,
+            left_stream,
+            right_stream,
+            left_buffer,
+            right_buffer,
             metrics,
         }
     }
@@ -810,40 +819,63 @@ impl Stream for ZipStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let poll = match self.zip_stream.poll_next_unpin(cx) {
-            Poll::Ready(Some((Ok(left_batch), Ok(right_batch)))) => {
-                self.metrics.time_elapsed_waiting.stop();
-                self.metrics.num_zips.add(1);
-                self.metrics.time_elapsed_zipping.start();
-                let zipped_batch = Self::batch_zip(&left_batch, &right_batch);
-                self.metrics.time_elapsed_zipping.stop();
-                Poll::Ready(Some(zipped_batch))
+        let mut left_none = false;
+        let mut right_none = false;
+        match self.left_stream.poll_next_unpin(cx) {
+            Poll::Ready(Some(Ok(left_batch))) => {
+                self.left_buffer.push_back(left_batch);
             }
-            Poll::Ready(Some((Err(e), _))) => {
+            Poll::Ready(Some(Err(e))) => {
                 self.metrics.time_elapsed_total.stop();
                 self.metrics.time_elapsed_waiting.stop();
-                Poll::Ready(Some(Err(e)))
-            }
-            Poll::Ready(Some((_, Err(e)))) => {
-                self.metrics.time_elapsed_total.stop();
-                self.metrics.time_elapsed_waiting.stop();
-                Poll::Ready(Some(Err(e)))
+                return Poll::Ready(Some(Err(e)));
             }
             Poll::Ready(None) => {
+                left_none = true;
+            }
+            Poll::Pending => {}
+        }
+        match self.right_stream.poll_next_unpin(cx) {
+            Poll::Ready(Some(Ok(right_batch))) => {
+                self.right_buffer.push_back(right_batch);
+            }
+            Poll::Ready(Some(Err(e))) => {
                 self.metrics.time_elapsed_total.stop();
                 self.metrics.time_elapsed_waiting.stop();
-                Poll::Ready(None)
+                return Poll::Ready(Some(Err(e)));
             }
-            _ => {
-                self.metrics.time_elapsed_waiting.start();
-                Poll::Pending
+            Poll::Ready(None) => {
+                right_none = true;
             }
-        };
-        poll
+            Poll::Pending => {}
+        }
+
+        if let (Some(_), Some(_)) = (self.left_buffer.front(), self.right_buffer.front()) {
+            let left_batch = self
+                .left_buffer
+                .pop_front()
+                .expect("Panic, can't get left batch, this shouldn't happen");
+            let right_batch = self
+                .right_buffer
+                .pop_front()
+                .expect("Panic, can't get right batch, this shouldn't happen");
+            self.metrics.time_elapsed_waiting.stop();
+            self.metrics.num_zips.add(1);
+            self.metrics.time_elapsed_zipping.start();
+            let zipped_batch = Self::batch_zip(&left_batch, &right_batch);
+            self.metrics.time_elapsed_zipping.stop();
+            return Poll::Ready(Some(zipped_batch));
+        } else if left_none && right_none {
+            self.metrics.time_elapsed_waiting.stop();
+            self.metrics.time_elapsed_total.stop();
+            return Poll::Ready(None);
+        }
+        self.metrics.time_elapsed_waiting.start();
+        Poll::Pending
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         // Same number of record batches
-        self.zip_stream.size_hint()
+        self.left_stream.size_hint()
     }
 }
