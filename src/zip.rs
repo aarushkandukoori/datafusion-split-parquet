@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion::physical_plan::metrics::MetricsSet;
 use std::any::Any;
 use std::collections::HashMap;
-use std::fmt::Display;
 use std::fs::File;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -26,8 +26,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use datafusion::catalog::Session;
+use datafusion::common::instant::Instant;
 use datafusion::common::{DFSchema, DataFusionError, Result, internal_datafusion_err};
-use datafusion::config::{ParquetOptions, TableParquetOptions};
+
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{ParquetAccessPlan, RowGroupAccessPlanFilter};
@@ -49,7 +50,7 @@ use datafusion::physical_expr::equivalence::join_equivalence_properties;
 use datafusion::physical_optimizer::pruning::build_pruning_predicate;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
+use datafusion::physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, Time};
 use datafusion::physical_plan::{
     DisplayAs, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
@@ -61,8 +62,8 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::datasource::memory::DataSourceExec;
 use futures::future::BoxFuture;
-use futures::stream::Zip;
-use futures::{FutureExt, Stream, StreamExt};
+use futures::stream::{StreamFuture, Zip};
+use futures::{FutureExt, Stream, StreamExt, stream::Buffered};
 use object_store::ObjectStore;
 
 #[derive(Debug)]
@@ -350,7 +351,7 @@ impl TableProvider for ZippedTableProvider {
 
             let file_source = Arc::new(
                 ParquetSource::default()
-                    .with_bloom_filter_on_read(true)
+                    .with_bloom_filter_on_read(false)
                     // provide the factory to create parquet reader without re-reading metadata
                     .with_parquet_file_reader_factory(Arc::new(reader_factory)),
                 // We do not attach a predicate here, as all of our predicate
@@ -549,33 +550,61 @@ pub struct ZipExec {
     right_input: Arc<dyn ExecutionPlan>,
     left_info: Option<Arc<ZipPartitionInfo>>,
     right_info: Option<Arc<ZipPartitionInfo>>,
-    left_metrics: ZipMetrics,
-    right_metrics: ZipMetrics,
+    metrics: ExecutionPlanMetricsSet,
     cache: PlanProperties,
 }
 
+/// A timer that can be started and stopped.
 #[derive(Debug, Clone)]
-pub struct ZipMetrics {
-    num_rows_seen: usize,
-    num_batches_seen: usize,
+pub struct StartableTime {
+    pub metrics: Time,
+    // use for record each part cost time, will eventually add into 'metrics'.
+    pub start: Option<Instant>,
 }
 
-impl ZipMetrics {
-    fn new() -> Self {
-        Self {
-            num_rows_seen: 0,
-            num_batches_seen: 0,
+impl StartableTime {
+    pub fn start(&mut self) {
+        if self.start.is_none() {
+            self.start = Some(Instant::now());
+        }
+    }
+
+    pub fn stop(&mut self) {
+        if let Some(start) = self.start.take() {
+            self.metrics.add_elapsed(start);
         }
     }
 }
 
-impl Display for ZipMetrics {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let num_rows_seen = self.num_rows_seen;
-        let num_batches_seen = self.num_batches_seen;
-        let output =
-            format!("{{num_rows_seen={num_rows_seen}, num_batches_seen={num_batches_seen}}}");
-        write!(f, "{}", output)
+#[derive(Debug, Clone)]
+pub struct ZipMetrics {
+    time_elapsed_waiting: StartableTime,
+    time_elapsed_zipping: StartableTime,
+    time_elapsed_total: StartableTime,
+    num_zips: Count,
+}
+
+impl ZipMetrics {
+    fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        let time_elapsed_waiting = StartableTime {
+            metrics: MetricBuilder::new(metrics).subset_time("time_elapsed_waiting", partition),
+            start: None,
+        };
+        let time_elapsed_zipping = StartableTime {
+            metrics: MetricBuilder::new(metrics).subset_time("time_elapsed_zipping", partition),
+            start: None,
+        };
+        let time_elapsed_total = StartableTime {
+            metrics: MetricBuilder::new(metrics).subset_time("time_elapsed_total", partition),
+            start: None,
+        };
+        let num_zips = MetricBuilder::new(metrics).counter("num_zips", partition);
+        Self {
+            time_elapsed_waiting,
+            time_elapsed_zipping,
+            time_elapsed_total,
+            num_zips,
+        }
     }
 }
 
@@ -624,16 +653,13 @@ impl ZipExec {
             Arc::unwrap_or_clone(right_input.schema().clone()),
         ])?);
         let cache = Self::compute_properties(&left_input, &right_input, schema.clone())?;
-        let left_metrics = ZipMetrics::new();
-        let right_metrics = ZipMetrics::new();
         Ok(Self {
             schema,
             left_input,
             right_input,
             left_info,
             right_info,
-            left_metrics,
-            right_metrics,
+            metrics: ExecutionPlanMetricsSet::new(),
             cache,
         })
     }
@@ -671,11 +697,8 @@ impl DisplayAs for ZipExec {
         _t: datafusion::physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        write!(
-            f,
-            "ZipExec(left_metrics={}, right_metrics={})",
-            self.left_metrics, self.right_metrics
-        )
+        let metrics_string = format!("{:?}", self.metrics.clone_inner().aggregate_by_name());
+        write!(f, "ZipExec({})", metrics_string)
     }
 }
 
@@ -696,6 +719,10 @@ impl ExecutionPlan for ZipExec {
     fn maintains_input_order(&self) -> Vec<bool> {
         // Tell optimizer this operator doesn't reorder its input
         vec![true, true]
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -721,10 +748,13 @@ impl ExecutionPlan for ZipExec {
     ) -> Result<SendableRecordBatchStream> {
         let left_stream = self.left_input.execute(partition, Arc::clone(&context))?;
         let right_stream = self.right_input.execute(partition, Arc::clone(&context))?;
+        let mut zip_metrics = ZipMetrics::new(&self.metrics, partition);
+        zip_metrics.time_elapsed_total.start();
         Ok(Box::pin(ZipStream::new(
             Arc::clone(&self.schema),
             left_stream,
             right_stream,
+            zip_metrics,
         )))
     }
 }
@@ -732,6 +762,7 @@ impl ExecutionPlan for ZipExec {
 pub struct ZipStream {
     schema: SchemaRef,
     zip_stream: Zip<SendableRecordBatchStream, SendableRecordBatchStream>,
+    metrics: ZipMetrics,
 }
 
 impl ZipStream {
@@ -739,9 +770,14 @@ impl ZipStream {
         schema: SchemaRef,
         left_input: SendableRecordBatchStream,
         right_input: SendableRecordBatchStream,
+        metrics: ZipMetrics,
     ) -> Self {
         let zip_stream = left_input.zip(right_input);
-        Self { schema, zip_stream }
+        Self {
+            schema,
+            zip_stream,
+            metrics,
+        }
     }
 
     fn batch_zip(left_batch: &RecordBatch, right_batch: &RecordBatch) -> Result<RecordBatch> {
@@ -776,12 +812,32 @@ impl Stream for ZipStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let poll = match self.zip_stream.poll_next_unpin(cx) {
             Poll::Ready(Some((Ok(left_batch), Ok(right_batch)))) => {
-                Poll::Ready(Some(Self::batch_zip(&left_batch, &right_batch)))
+                self.metrics.time_elapsed_waiting.stop();
+                self.metrics.num_zips.add(1);
+                self.metrics.time_elapsed_zipping.start();
+                let zipped_batch = Self::batch_zip(&left_batch, &right_batch);
+                self.metrics.time_elapsed_zipping.stop();
+                Poll::Ready(Some(zipped_batch))
             }
-            Poll::Ready(Some((Err(e), _))) => Poll::Ready(Some(Err(e))),
-            Poll::Ready(Some((_, Err(e)))) => Poll::Ready(Some(Err(e))),
-            Poll::Ready(None) => Poll::Ready(None),
-            _ => Poll::Pending,
+            Poll::Ready(Some((Err(e), _))) => {
+                self.metrics.time_elapsed_total.stop();
+                self.metrics.time_elapsed_waiting.stop();
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(Some((_, Err(e)))) => {
+                self.metrics.time_elapsed_total.stop();
+                self.metrics.time_elapsed_waiting.stop();
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                self.metrics.time_elapsed_total.stop();
+                self.metrics.time_elapsed_waiting.stop();
+                Poll::Ready(None)
+            }
+            _ => {
+                self.metrics.time_elapsed_waiting.start();
+                Poll::Pending
+            }
         };
         poll
     }
