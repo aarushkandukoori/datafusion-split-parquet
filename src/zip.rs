@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion::common::stats::Precision;
 use datafusion::physical_plan::metrics::MetricsSet;
 use std::any::Any;
-use std::collections::HashMap;
 use std::fs::File;
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -27,14 +26,15 @@ use std::task::{Context, Poll};
 
 use datafusion::catalog::Session;
 use datafusion::common::instant::Instant;
-use datafusion::common::{DFSchema, DataFusionError, Result, internal_datafusion_err};
+use datafusion::common::{DFSchema, DataFusionError, Result, Statistics, internal_datafusion_err};
 
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::PartitionedFile;
-use datafusion::datasource::physical_plan::parquet::{ParquetAccessPlan, RowGroupAccessPlanFilter};
+use datafusion::datasource::physical_plan::parquet::{
+    DefaultParquetFileReaderFactory, ParquetAccessPlan, RowGroupAccess, RowGroupAccessPlanFilter,
+};
 use datafusion::datasource::physical_plan::{
-    FileGroup, FileMeta, FileScanConfig, FileScanConfigBuilder, ParquetFileMetrics,
-    ParquetFileReaderFactory, ParquetSource,
+    FileGroup, FileScanConfig, FileScanConfigBuilder, ParquetFileMetrics, ParquetSource,
 };
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
@@ -43,13 +43,12 @@ use datafusion::logical_expr::{TableProviderFilterPushDown, TableType};
 use datafusion::parquet::arrow::arrow_reader::{
     ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
-use datafusion::parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
+
 use datafusion::parquet::file::metadata::ParquetMetaData;
-use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_expr::equivalence::join_equivalence_properties;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_optimizer::pruning::build_pruning_predicate;
 use datafusion::physical_plan::empty::EmptyExec;
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::execution_plan::{Boundedness, CardinalityEffect, EmissionType};
 use datafusion::physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, Time};
 use datafusion::physical_plan::{
     DisplayAs, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
@@ -57,13 +56,11 @@ use datafusion::physical_plan::{
 use datafusion::prelude::*;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::datasource::memory::DataSourceExec;
-use futures::future::BoxFuture;
-use futures::stream::{StreamFuture, Zip};
-use futures::{FutureExt, Stream, StreamExt, stream::Buffered};
+use futures::stream::Zip;
+use futures::{Stream, StreamExt};
 use object_store::ObjectStore;
 
 #[derive(Debug)]
@@ -75,6 +72,7 @@ pub struct ZippedTableProvider {
     /// The underlying object store
     object_store: Arc<dyn ObjectStore>,
     metrics: ExecutionPlanMetricsSet,
+    num_rows: i64,
 }
 
 impl ZippedTableProvider {
@@ -93,12 +91,22 @@ impl ZippedTableProvider {
                 .iter()
                 .map(|f| Arc::unwrap_or_clone(f.schema.clone())),
         )?);
-
+        let num_rows = zipped_files
+            .first()
+            .map(|zf| {
+                zf.metadata
+                    .row_groups()
+                    .iter()
+                    .map(|rg| rg.num_rows())
+                    .sum()
+            })
+            .unwrap_or(0);
         Ok(Self {
             zipped_files,
             schema,
             object_store,
             metrics: ExecutionPlanMetricsSet::new(),
+            num_rows,
         })
     }
 
@@ -158,6 +166,25 @@ impl ZippedTableProvider {
             }
         }
         Ok(row_groups.build())
+    }
+
+    fn estimate_rows(&self, access_plan: &ParquetAccessPlan) -> usize {
+        self.zipped_files
+            .get(0)
+            .map(|zf| {
+                zf.metadata
+                    .row_groups()
+                    .iter()
+                    .map(|rgm| rgm.num_rows())
+                    .zip(access_plan.clone().into_inner())
+                    .map(|(num_rows, should_scan)| match should_scan {
+                        RowGroupAccess::Skip => 0 as usize,
+                        RowGroupAccess::Scan => num_rows as usize,
+                        RowGroupAccess::Selection(selection) => selection.row_count(),
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
     }
 }
 
@@ -313,6 +340,11 @@ impl ZipPartitionInfo {
 /// so that we can query it as a table.
 #[async_trait]
 impl TableProvider for ZippedTableProvider {
+    fn statistics(&self) -> Option<Statistics> {
+        let stats = Statistics::default().with_num_rows(Precision::Exact(self.num_rows as usize));
+        Some(stats)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -322,7 +354,7 @@ impl TableProvider for ZippedTableProvider {
     }
 
     fn table_type(&self) -> TableType {
-        TableType::Base
+        TableType::View
     }
 
     async fn scan(
@@ -339,6 +371,8 @@ impl TableProvider for ZippedTableProvider {
         let predicate = self.filters_to_predicate(state, filters)?;
         // Figure out which row groups to scan based on the predicate
         let access_plan = self.create_plan(&predicate)?;
+        // Estimate the number of rows that the operator will yield, important for optimizer
+        let estimated_rows = self.estimate_rows(&access_plan);
         for zipped_file in &self.zipped_files {
             // Prepare for scanning
             let schema = zipped_file.schema.clone();
@@ -346,8 +380,7 @@ impl TableProvider for ZippedTableProvider {
 
             // Configure a factory interface to avoid re-reading the metadata for each file
             let reader_factory =
-                CachedParquetFileReaderFactory::new(Arc::clone(&self.object_store))
-                    .with_file(zipped_file);
+                DefaultParquetFileReaderFactory::new(Arc::clone(&self.object_store));
 
             let file_source = Arc::new(
                 ParquetSource::default()
@@ -377,9 +410,9 @@ impl TableProvider for ZippedTableProvider {
                     zipped_file.row_group_ranges.clone(),
                 );
                 let file_scan_config =
-                    FileScanConfigBuilder::new(object_store_url, schema, file_source)
+                    FileScanConfigBuilder::new(object_store_url, schema.clone(), file_source)
                         .with_limit(limit)
-                        .with_projection(file_projection)
+                        .with_projection_indices(file_projection)
                         .with_file_groups(partition_file(
                             zip_partition_info.path.clone(),
                             zip_partition_info.file_size,
@@ -387,6 +420,10 @@ impl TableProvider for ZippedTableProvider {
                             target_partitions,
                             zip_partition_info.access_plan.clone(),
                         ))
+                        .with_statistics(
+                            Statistics::new_unknown(&schema)
+                                .with_num_rows(Precision::Exact(estimated_rows)),
+                        )
                         .build();
                 file_scans.push((file_scan_config, zip_partition_info));
             }
@@ -408,8 +445,8 @@ impl TableProvider for ZippedTableProvider {
         while let Some(file_scan) = files_to_scan.next() {
             let new_file_scan_op = DataSourceExec::from_data_source(file_scan.0.clone());
             exec_plan = Arc::new(ZipExec::try_new(
-                exec_plan,
                 new_file_scan_op,
+                exec_plan,
                 None,
                 Some(Arc::new(file_scan.1.clone())),
             )?);
@@ -427,119 +464,6 @@ impl TableProvider for ZippedTableProvider {
         // is not done at the row level -- there may be rows in returned files
         // that do not pass the filter
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
-    }
-}
-
-/// A custom [`ParquetFileReaderFactory`] that handles opening parquet files
-/// from object storage, and uses pre-loaded metadata.
-
-#[derive(Debug)]
-struct CachedParquetFileReaderFactory {
-    /// The underlying object store implementation for reading file data
-    object_store: Arc<dyn ObjectStore>,
-    /// The parquet metadata for each file in the index, keyed by the file name
-    /// (e.g. `file1.parquet`)
-    metadata: HashMap<String, Arc<ParquetMetaData>>,
-}
-
-impl CachedParquetFileReaderFactory {
-    fn new(object_store: Arc<dyn ObjectStore>) -> Self {
-        Self {
-            object_store,
-            metadata: HashMap::new(),
-        }
-    }
-    /// Add the pre-parsed information about the file to the factor
-    fn with_file(mut self, zipped_file: &ZippedFile) -> Self {
-        self.metadata.insert(
-            zipped_file.file_name.clone(),
-            Arc::clone(&zipped_file.metadata),
-        );
-        self
-    }
-}
-
-impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
-    fn create_reader(
-        &self,
-        _partition_index: usize,
-        file_meta: FileMeta,
-        metadata_size_hint: Option<usize>,
-        _metrics: &ExecutionPlanMetricsSet,
-    ) -> Result<Box<dyn AsyncFileReader + Send>> {
-        // for this example we ignore the partition index and metrics
-        // but in a real system you would likely use them to report details on
-        // the performance of the reader.
-        let filename = file_meta
-            .location()
-            .parts()
-            .last()
-            .expect("No path in location")
-            .as_ref()
-            .to_string();
-
-        let object_store = Arc::clone(&self.object_store);
-        let mut inner = ParquetObjectReader::new(object_store, file_meta.object_meta.location)
-            .with_file_size(file_meta.object_meta.size);
-
-        if let Some(hint) = metadata_size_hint {
-            inner = inner.with_footer_size_hint(hint)
-        };
-
-        let metadata = self
-            .metadata
-            .get(&filename)
-            .expect("metadata for file not found: {filename}");
-        Ok(Box::new(ParquetReaderWithCache {
-            filename,
-            metadata: Arc::clone(metadata),
-            inner,
-            call_count: 0,
-        }))
-    }
-}
-
-/// wrapper around a ParquetObjectReader that caches metadata
-struct ParquetReaderWithCache {
-    filename: String,
-    metadata: Arc<ParquetMetaData>,
-    inner: ParquetObjectReader,
-    call_count: i32,
-}
-
-impl AsyncFileReader for ParquetReaderWithCache {
-    fn get_bytes(
-        &mut self,
-        range: Range<u64>,
-    ) -> BoxFuture<'_, datafusion::parquet::errors::Result<Bytes>> {
-        //println!("get_bytes: {} Reading range {:?}", self.filename, range);
-        self.call_count += 1;
-        self.inner.get_bytes(range)
-    }
-
-    fn get_byte_ranges(
-        &mut self,
-        ranges: Vec<Range<u64>>,
-    ) -> BoxFuture<'_, datafusion::parquet::errors::Result<Vec<Bytes>>> {
-        /*
-        println!(
-            "get_byte_ranges: {} Reading ranges {:?}",
-            self.filename, ranges
-        );
-        */
-        self.call_count += 1;
-        self.inner.get_byte_ranges(ranges)
-    }
-
-    fn get_metadata(
-        &mut self,
-        _options: Option<&ArrowReaderOptions>,
-    ) -> BoxFuture<'_, datafusion::parquet::errors::Result<Arc<ParquetMetaData>>> {
-        //println!("get_metadata: {} returning cached metadata", self.filename);
-
-        // return the cached metadata so the parquet reader does not read it
-        let metadata = self.metadata.clone();
-        async move { Ok(metadata) }.boxed()
     }
 }
 
@@ -670,20 +594,10 @@ impl ZipExec {
         right: &Arc<dyn ExecutionPlan>,
         schema: SchemaRef,
     ) -> Result<PlanProperties> {
-        let eq_properties = join_equivalence_properties(
-            left.equivalence_properties().clone(),
-            right.equivalence_properties().clone(),
-            &JoinType::Full,
-            schema,
-            &[false, false],
-            None,
-            &[],
-        )?;
-
         // Get output partitioning:
         let output_partitioning = left.output_partitioning();
         Ok(PlanProperties::new(
-            eq_properties,
+            EquivalenceProperties::new(schema),
             output_partitioning.clone(),
             EmissionType::Incremental,
             boundedness_from_children([left, right]),
@@ -712,6 +626,9 @@ impl ExecutionPlan for ZipExec {
         self
     }
 
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Equal
+    }
     fn properties(&self) -> &PlanProperties {
         &self.cache
     }
