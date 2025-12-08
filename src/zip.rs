@@ -16,6 +16,7 @@
 // under the License.
 
 use datafusion::common::stats::Precision;
+use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
 use datafusion::physical_plan::metrics::MetricsSet;
 use std::any::Any;
 use std::fs::File;
@@ -186,6 +187,27 @@ impl ZippedTableProvider {
             })
             .unwrap_or(0)
     }
+    fn estimate_bytes(&self, access_plan: &ParquetAccessPlan) -> usize {
+        self.zipped_files
+            .get(0)
+            .map(|zf| {
+                zf.metadata
+                    .row_groups()
+                    .iter()
+                    .map(|rgm| (rgm.num_rows(), rgm.total_byte_size()))
+                    .zip(access_plan.clone().into_inner())
+                    .map(|((num_rows, total_bytes), should_scan)| match should_scan {
+                        RowGroupAccess::Skip => 0 as usize,
+                        RowGroupAccess::Scan => total_bytes as usize,
+                        RowGroupAccess::Selection(selection) => {
+                            ((selection.row_count() as f32 / num_rows as f32) * total_bytes as f32)
+                                as usize
+                        }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
 }
 
 /// Stores information needed to scan a file
@@ -340,13 +362,15 @@ impl ZipPartitionInfo {
 /// so that we can query it as a table.
 #[async_trait]
 impl TableProvider for ZippedTableProvider {
-    fn statistics(&self) -> Option<Statistics> {
-        let stats = Statistics::default().with_num_rows(Precision::Exact(self.num_rows as usize));
-        Some(stats)
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn statistics(&self) -> Option<Statistics> {
+        Some(
+            Statistics::new_unknown(&self.schema)
+                .with_num_rows(Precision::Inexact(self.num_rows as usize)),
+        )
     }
 
     fn schema(&self) -> SchemaRef {
@@ -354,7 +378,7 @@ impl TableProvider for ZippedTableProvider {
     }
 
     fn table_type(&self) -> TableType {
-        TableType::View
+        TableType::Base
     }
 
     async fn scan(
@@ -373,11 +397,20 @@ impl TableProvider for ZippedTableProvider {
         let access_plan = self.create_plan(&predicate)?;
         // Estimate the number of rows that the operator will yield, important for optimizer
         let estimated_rows = self.estimate_rows(&access_plan);
+        let estimated_byte_size = self.estimate_bytes(&access_plan);
         for zipped_file in &self.zipped_files {
             // Prepare for scanning
             let schema = zipped_file.schema.clone();
             let object_store_url = ObjectStoreUrl::parse("file://")?;
-
+            let statistics = DFParquetMetadata::statistics_from_parquet_metadata(
+                &zipped_file.metadata,
+                &schema.clone(),
+            )
+            .unwrap_or(Statistics::new_unknown(&schema))
+            .with_total_byte_size(Precision::Exact(estimated_byte_size))
+            .with_num_rows(Precision::Exact(estimated_rows));
+            //println!("creating file with schema = {}", schema.clone());
+            //println!("creating file with statistics = {}", statistics.clone());
             // Configure a factory interface to avoid re-reading the metadata for each file
             let reader_factory =
                 DefaultParquetFileReaderFactory::new(Arc::clone(&self.object_store));
@@ -409,9 +442,11 @@ impl TableProvider for ZippedTableProvider {
                     access_plan.clone(),
                     zipped_file.row_group_ranges.clone(),
                 );
+
                 let file_scan_config =
                     FileScanConfigBuilder::new(object_store_url, schema.clone(), file_source)
                         .with_limit(limit)
+                        .with_statistics(statistics)
                         .with_projection_indices(file_projection)
                         .with_file_groups(partition_file(
                             zip_partition_info.path.clone(),
@@ -420,10 +455,6 @@ impl TableProvider for ZippedTableProvider {
                             target_partitions,
                             zip_partition_info.access_plan.clone(),
                         ))
-                        .with_statistics(
-                            Statistics::new_unknown(&schema)
-                                .with_num_rows(Precision::Exact(estimated_rows)),
-                        )
                         .build();
                 file_scans.push((file_scan_config, zip_partition_info));
             }
@@ -435,8 +466,6 @@ impl TableProvider for ZippedTableProvider {
                 (Some(left), Some(right)) => Arc::new(ZipExec::try_new(
                     DataSourceExec::from_data_source(left.0.clone()),
                     DataSourceExec::from_data_source(right.0.clone()),
-                    Some(Arc::new(left.1.clone())),
-                    Some(Arc::new(right.1.clone())),
                 )?),
                 (Some(left), None) => DataSourceExec::from_data_source(left.0.clone()),
                 (None, Some(right)) => DataSourceExec::from_data_source(right.0.clone()),
@@ -444,14 +473,8 @@ impl TableProvider for ZippedTableProvider {
             };
         while let Some(file_scan) = files_to_scan.next() {
             let new_file_scan_op = DataSourceExec::from_data_source(file_scan.0.clone());
-            exec_plan = Arc::new(ZipExec::try_new(
-                new_file_scan_op,
-                exec_plan,
-                None,
-                Some(Arc::new(file_scan.1.clone())),
-            )?);
+            exec_plan = Arc::new(ZipExec::try_new(exec_plan, new_file_scan_op)?);
         }
-        // Finally, put it all together into a DataSourceExec
         Ok(exec_plan)
     }
 
@@ -472,8 +495,6 @@ pub struct ZipExec {
     schema: SchemaRef,
     left_input: Arc<dyn ExecutionPlan>,
     right_input: Arc<dyn ExecutionPlan>,
-    left_info: Option<Arc<ZipPartitionInfo>>,
-    right_info: Option<Arc<ZipPartitionInfo>>,
     metrics: ExecutionPlanMetricsSet,
     cache: PlanProperties,
 }
@@ -569,8 +590,6 @@ impl ZipExec {
     pub fn try_new(
         left_input: Arc<dyn ExecutionPlan>,
         right_input: Arc<dyn ExecutionPlan>,
-        left_info: Option<Arc<ZipPartitionInfo>>,
-        right_info: Option<Arc<ZipPartitionInfo>>,
     ) -> Result<Self> {
         let schema = SchemaRef::from(Schema::try_merge(vec![
             Arc::unwrap_or_clone(left_input.schema().clone()),
@@ -581,8 +600,6 @@ impl ZipExec {
             schema,
             left_input,
             right_input,
-            left_info,
-            right_info,
             metrics: ExecutionPlanMetricsSet::new(),
             cache,
         })
@@ -629,6 +646,7 @@ impl ExecutionPlan for ZipExec {
     fn cardinality_effect(&self) -> CardinalityEffect {
         CardinalityEffect::Equal
     }
+
     fn properties(&self) -> &PlanProperties {
         &self.cache
     }
@@ -648,14 +666,33 @@ impl ExecutionPlan for ZipExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(ZipExec::try_new(
-            Arc::clone(&children[0]),
-            Arc::clone(&children[1]),
-            self.left_info.clone(),
-            self.right_info.clone(),
-        )?))
+        Ok(self)
+    }
+
+    fn statistics(&self) -> Result<Statistics> {
+        self.partition_statistics(None)
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        if partition.is_some() {
+            Ok(Statistics::new_unknown(&self.schema))
+        } else {
+            let left_stats = self.left_input.partition_statistics(partition)?;
+            let right_stats = self.right_input.partition_statistics(partition)?;
+            let mut combined_stats = Statistics::new_unknown(&self.schema)
+                .with_num_rows(left_stats.num_rows)
+                .with_total_byte_size(left_stats.total_byte_size.add(&right_stats.total_byte_size));
+            combined_stats.column_statistics = Vec::new();
+            for left_col in &left_stats.column_statistics {
+                combined_stats.column_statistics.push(left_col.clone());
+            }
+            for right_col in &right_stats.column_statistics {
+                combined_stats.column_statistics.push(right_col.clone());
+            }
+            Ok(combined_stats)
+        }
     }
 
     fn execute(

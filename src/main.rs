@@ -70,7 +70,7 @@ async fn tpch(trials: usize, queries: Option<Vec<usize>>) -> Result<Vec<TestResu
         for table_name in table_names {
             // Create a custom table provider with our special index.
             if test == "a" {
-                let parquet_options = ParquetReadOptions::default().parquet_pruning(true);
+                let parquet_options = ParquetReadOptions::default();
                 ctx.register_parquet(
                     table_name,
                     format!("data/tpch/{}_a0.parquet", table_name),
@@ -78,13 +78,20 @@ async fn tpch(trials: usize, queries: Option<Vec<usize>>) -> Result<Vec<TestResu
                 )
                 .await?;
             } else if test == "b" {
-                let provider = Arc::new(zip::ZippedTableProvider::try_new(
-                    Arc::clone(&object_store),
-                    vec![
-                        format!("data/tpch/{}_b0.parquet", table_name),
-                        format!("data/tpch/{}_b1.parquet", table_name),
-                    ],
-                )?);
+                let provider = if false {
+                    Arc::new(zip::ZippedTableProvider::try_new(
+                        Arc::clone(&object_store),
+                        vec![format!("data/tpch/{}_a0.parquet", table_name)],
+                    )?)
+                } else {
+                    Arc::new(zip::ZippedTableProvider::try_new(
+                        Arc::clone(&object_store),
+                        vec![
+                            format!("data/tpch/{}_b0.parquet", table_name),
+                            format!("data/tpch/{}_b1.parquet", table_name),
+                        ],
+                    )?)
+                };
                 ctx.register_table(table_name, Arc::clone(&provider) as _)?;
             } else if test == "c" {
                 let provider = Arc::new(zip::ZippedTableProvider::try_new(
@@ -129,8 +136,7 @@ async fn tpch(trials: usize, queries: Option<Vec<usize>>) -> Result<Vec<TestResu
                         //df.explain(false, false)?.show().await?;
                     } else {
                         df.clone().collect().await?;
-                        //println!("Explain:");
-                        //df.explain(true, true)?.show().await?;
+                        //df.explain(false, true)?.show().await?;
                     }
                 }
                 let end = Utc::now();
@@ -150,7 +156,26 @@ async fn smoke(trials: usize, queries: Option<Vec<usize>>) -> Result<Vec<TestRes
     let table_names = [
         "lineitem", "orders", "partsupp", "supplier", "nation", "region", "part", "customer",
     ];
-    let queries: Vec<String> = vec!["SELECT * FROM lineitem".into()];
+    let queries: Vec<String> = vec![
+        "SELECT * FROM lineitem WHERE l_shipdate > '1993-11-09' AND l_shipdate < '1993-11-13'" // 0.12%
+            .into(),
+        "SELECT * FROM lineitem WHERE l_shipdate > '1993-11-09' AND l_shipdate < '1993-12-05'" // 1%
+            .into(),
+        "SELECT * FROM lineitem WHERE l_shipdate > '1993-11-09' AND l_shipdate < '1994-07-09'" // 10%
+            .into(),
+        "SELECT * FROM lineitem WHERE l_shipdate > '1993-11-09' AND l_shipdate < '1997-02-25'" // 50%
+            .into(),
+        "SELECT * FROM lineitem".into(), // everything
+        // Prune row groups
+        "SELECT * FROM lineitem WHERE l_orderkey = 1 AND l_shipmode = 'TRUCK'".into(),
+        "SELECT l_orderkey, l_tax FROM lineitem".into(),
+        "SELECT sum(ps_supplycost * ps_availqty) * 0.0001000000 FROM partsupp, supplier, nation WHERE ps_suppkey = s_suppkey and s_nationkey = n_nationkey and n_name = 'ALGERIA'"
+            .into(),
+        "SELECT ps_supplycost FROM partsupp, supplier WHERE ps_suppkey = s_suppkey"
+            .into(),
+        "SELECT * FROM orders WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING SUM(l_quantity) > 313)".into(),
+        "SELECT * FROM orders WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING SUM(l_quantity) > 1)".into(),
+    ];
     let tests = ["a", "b"];
     for test in tests {
         let ctx = SessionContext::default();
@@ -217,10 +242,8 @@ async fn smoke(trials: usize, queries: Option<Vec<usize>>) -> Result<Vec<TestRes
                     .enumerate()
                 {
                     let df = ctx.sql(query_segment).await?;
-
                     df.clone().collect().await?;
-                    //println!("Explain:");
-                    df.explain(false, true)?.show().await?;
+                    df.explain(true, true)?.show().await?;
                 }
                 let end = Utc::now();
                 let runtime = (end - start).num_milliseconds();
@@ -260,7 +283,7 @@ fn results_to_df(results: Vec<TestResult>) -> DataFrame {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let results = smoke(1, None).await?;
+    let results = tpch(3, None).await?;
     let df = results_to_df(results);
     df.write_csv("test-data.csv", DataFrameWriteOptions::default(), None)
         .await?;
