@@ -323,6 +323,46 @@ async fn smoke(trials: usize, queries: Option<Vec<usize>>) -> Result<Vec<TestRes
     Ok(results)
 }
 
+/// Print `EXPLAIN ANALYZE` for one query under each storage variant, so we can
+/// see which physical operators dominate and how much the ZipExec stitching
+/// adds. Each query is run once to warm up before the analyzed run.
+async fn profile_query(cfg: &BenchConfig, q_num: usize) -> Result<()> {
+    let (_, sql) = cfg
+        .queries
+        .iter()
+        .find(|(n, _)| *n == q_num)
+        .unwrap_or_else(|| panic!("query Q{q_num} not found in {}", cfg.name));
+
+    for test in ["a", "b", "c"] {
+        let ctx = SessionContext::new();
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::local::LocalFileSystem::new());
+        for table in &cfg.tables {
+            register_variant(&ctx, &object_store, cfg.data_dir, table, test).await?;
+        }
+        let url = Url::try_from("file://").unwrap();
+        ctx.register_object_store(&url, object_store);
+
+        let label = match test {
+            "a" => "control (1 file)",
+            "b" => "2-way split (zipped)",
+            _ => "3-way split (zipped)",
+        };
+        println!("\n================ {} Q{} :: {} ================", cfg.name, q_num, label);
+        for segment in sql
+            .split(';')
+            .filter(|s| !s.split_whitespace().collect::<String>().is_empty())
+        {
+            // Warm up once so the analyzed run reflects steady-state, not
+            // one-time parquet metadata reads.
+            ctx.sql(segment).await?.collect().await?;
+            let explained = ctx.sql(segment).await?.explain(false, true)?;
+            explained.show().await?;
+        }
+    }
+    Ok(())
+}
+
 fn results_to_df(results: Vec<TestResult>) -> DataFrame {
     let tests = Arc::new(StringArray::from(
         results
@@ -350,10 +390,13 @@ fn results_to_df(results: Vec<TestResult>) -> DataFrame {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Pick the benchmark from the CLI: `cargo run --release -- tpcds`
-    // (defaults to tpch to preserve the original behavior).
-    let benchmark = std::env::args().nth(1).unwrap_or_else(|| "tpch".to_string());
-    let cfg = match benchmark.as_str() {
+    // Usage:
+    //   cargo run --release [-- <bench>]              run the full benchmark
+    //   cargo run --release -- <bench> profile <N>    EXPLAIN ANALYZE query N per variant
+    // <bench> is tpch (default) or tpcds.
+    let args: Vec<String> = std::env::args().collect();
+    let benchmark = args.get(1).map(String::as_str).unwrap_or("tpch");
+    let cfg = match benchmark {
         "tpch" => tpch_config(),
         "tpcds" => tpcds_config(),
         other => {
@@ -361,6 +404,16 @@ async fn main() -> Result<()> {
             std::process::exit(1);
         }
     };
+
+    if args.get(2).map(String::as_str) == Some("profile") {
+        let q: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+            eprintln!("usage: {} profile <query_number>", cfg.name);
+            std::process::exit(1);
+        });
+        profile_query(&cfg, q).await?;
+        return Ok(());
+    }
+
     println!(
         "Running {} benchmark ({} tables, {} queries loaded)",
         cfg.name,
