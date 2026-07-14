@@ -3,3 +3,4 @@
 /results
 /test-data*.csv
 *_partition_runtime.png
+*_summary.png
