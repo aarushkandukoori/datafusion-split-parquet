@@ -17,17 +17,77 @@
 
 use datafusion::{
     arrow::array::{Int64Array, StringArray, UInt32Array, UInt64Array},
-    common::Result,
+    common::{DataFusionError, Result},
     dataframe::DataFrameWriteOptions,
 };
 use std::{collections::HashSet, fs, sync::Arc};
 
 use chrono::Utc;
+use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::prelude::*;
+use object_store::path::Path as ObjPath;
 use object_store::ObjectStore;
-use url::Url;
 
 pub mod zip;
+
+/// Where the parquet files are read from. Chosen with the `STORAGE` env var:
+/// `local` (default) reads from the local filesystem; `s3` reads from an
+/// S3-compatible store (e.g. a local MinIO), configured with the S3_* env vars.
+struct Storage {
+    store: Arc<dyn ObjectStore>,
+    url: ObjectStoreUrl,
+    s3: bool,
+    bucket: String,
+}
+
+impl Storage {
+    fn from_env() -> Result<Self> {
+        if std::env::var("STORAGE").as_deref() == Ok("s3") {
+            let endpoint =
+                std::env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".into());
+            let bucket = std::env::var("S3_BUCKET").unwrap_or_else(|_| "bench".into());
+            let key = std::env::var("S3_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into());
+            let secret = std::env::var("S3_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into());
+            let store = object_store::aws::AmazonS3Builder::new()
+                .with_endpoint(endpoint)
+                .with_bucket_name(&bucket)
+                .with_region("us-east-1")
+                .with_access_key_id(key)
+                .with_secret_access_key(secret)
+                .with_allow_http(true)
+                .build()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let url = ObjectStoreUrl::parse(format!("s3://{bucket}"))?;
+            Ok(Self { store: Arc::new(store), url, s3: true, bucket })
+        } else {
+            Ok(Self {
+                store: Arc::new(object_store::local::LocalFileSystem::new()),
+                url: ObjectStoreUrl::parse("file://")?,
+                s3: false,
+                bucket: String::new(),
+            })
+        }
+    }
+
+    /// Source string for the single-file control, passed to `register_parquet`.
+    fn control_source(&self, cfg: &BenchConfig, table: &str) -> String {
+        if self.s3 {
+            format!("s3://{}/{}/{}_a0.parquet", self.bucket, cfg.name, table)
+        } else {
+            format!("{}/{}_a0.parquet", cfg.data_dir, table)
+        }
+    }
+
+    /// Object-store key for a split file, passed to the ZippedTableProvider.
+    fn key(&self, cfg: &BenchConfig, filename: &str) -> Result<ObjPath> {
+        if self.s3 {
+            Ok(ObjPath::from(format!("{}/{}", cfg.name, filename)))
+        } else {
+            let abs = std::fs::canonicalize(format!("{}/{}", cfg.data_dir, filename))?;
+            ObjPath::from_absolute_path(abs).map_err(|e| DataFusionError::External(Box::new(e)))
+        }
+    }
+}
 
 pub struct TestResult {
     test: String,
@@ -104,8 +164,8 @@ fn tpcds_config() -> BenchConfig {
 ///   "c" -> a 3-way vertical split
 async fn register_variant(
     ctx: &SessionContext,
-    object_store: &Arc<dyn ObjectStore>,
-    data_dir: &str,
+    storage: &Storage,
+    cfg: &BenchConfig,
     table: &str,
     test: &str,
 ) -> Result<()> {
@@ -113,30 +173,34 @@ async fn register_variant(
         "a" => {
             ctx.register_parquet(
                 table,
-                format!("{data_dir}/{table}_a0.parquet"),
+                storage.control_source(cfg, table),
                 ParquetReadOptions::default(),
             )
             .await?;
         }
         "b" => {
             let provider = zip::ZippedTableProvider::try_new(
-                Arc::clone(object_store),
+                Arc::clone(&storage.store),
+                storage.url.clone(),
                 vec![
-                    format!("{data_dir}/{table}_b0.parquet"),
-                    format!("{data_dir}/{table}_b1.parquet"),
+                    storage.key(cfg, &format!("{table}_b0.parquet"))?,
+                    storage.key(cfg, &format!("{table}_b1.parquet"))?,
                 ],
-            )?;
+            )
+            .await?;
             ctx.register_table(table, Arc::new(provider) as _)?;
         }
         "c" => {
             let provider = zip::ZippedTableProvider::try_new(
-                Arc::clone(object_store),
+                Arc::clone(&storage.store),
+                storage.url.clone(),
                 vec![
-                    format!("{data_dir}/{table}_c0.parquet"),
-                    format!("{data_dir}/{table}_c1.parquet"),
-                    format!("{data_dir}/{table}_c2.parquet"),
+                    storage.key(cfg, &format!("{table}_c0.parquet"))?,
+                    storage.key(cfg, &format!("{table}_c1.parquet"))?,
+                    storage.key(cfg, &format!("{table}_c2.parquet"))?,
                 ],
-            )?;
+            )
+            .await?;
             ctx.register_table(table, Arc::new(provider) as _)?;
         }
         other => unreachable!("unknown test variant {other}"),
@@ -170,19 +234,14 @@ async fn run_bench(
 ) -> Result<Vec<TestResult>> {
     let subset = queries.map(|q| HashSet::from_iter(q));
     let mut results = Vec::new();
+    let storage = Storage::from_env()?;
     let tests = ["a", "b", "c"];
     for test in tests {
         let ctx = SessionContext::new();
-        // The object store reads the parquet files. Here it is the local file
-        // system, but in a real system it could be S3, GCS, etc.
-        let object_store: Arc<dyn ObjectStore> =
-            Arc::new(object_store::local::LocalFileSystem::new());
+        ctx.register_object_store(storage.url.as_ref(), Arc::clone(&storage.store));
         for table in &cfg.tables {
-            register_variant(&ctx, &object_store, cfg.data_dir, table, test).await?;
+            register_variant(&ctx, &storage, cfg, table, test).await?;
         }
-        // register object store provider so that urls like `file://` work
-        let url = Url::try_from("file://").unwrap();
-        ctx.register_object_store(&url, object_store);
 
         for t in 0..trials as u32 {
             for (q_num, sql) in cfg.queries.iter().filter(|(n, _)| {
@@ -215,114 +274,6 @@ async fn run_bench(
     Ok(results)
 }
 
-// Kept as a lightweight debugging harness for selective/pruning experiments.
-#[allow(dead_code)]
-async fn smoke(trials: usize, queries: Option<Vec<usize>>) -> Result<Vec<TestResult>> {
-    let subset_queries = queries.map(|q| HashSet::from_iter(q));
-    let mut results = Vec::new();
-    let table_names = [
-        "lineitem", "orders", "partsupp", "supplier", "nation", "region", "part", "customer",
-    ];
-    let queries: Vec<String> = vec![
-        "SELECT * FROM lineitem WHERE l_shipdate > '1993-11-09' AND l_shipdate < '1993-11-13'" // 0.12%
-            .into(),
-        "SELECT * FROM lineitem WHERE l_shipdate > '1993-11-09' AND l_shipdate < '1993-12-05'" // 1%
-            .into(),
-        "SELECT * FROM lineitem WHERE l_shipdate > '1993-11-09' AND l_shipdate < '1994-07-09'" // 10%
-            .into(),
-        "SELECT * FROM lineitem WHERE l_shipdate > '1993-11-09' AND l_shipdate < '1997-02-25'" // 50%
-            .into(),
-        "SELECT * FROM lineitem".into(), // everything
-        // Prune row groups
-        "SELECT * FROM lineitem WHERE l_orderkey = 1 AND l_shipmode = 'TRUCK'".into(),
-        "SELECT l_orderkey, l_tax FROM lineitem".into(),
-        "SELECT sum(ps_supplycost * ps_availqty) * 0.0001000000 FROM partsupp, supplier, nation WHERE ps_suppkey = s_suppkey and s_nationkey = n_nationkey and n_name = 'ALGERIA'"
-            .into(),
-        "SELECT ps_supplycost FROM partsupp, supplier WHERE ps_suppkey = s_suppkey"
-            .into(),
-        "SELECT * FROM orders WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING SUM(l_quantity) > 313)".into(),
-        "SELECT * FROM orders WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING SUM(l_quantity) > 1)".into(),
-    ];
-    let tests = ["a", "b"];
-    for test in tests {
-        let ctx = SessionContext::default();
-        // the object store is used to read the parquet files (in this case, it is
-        // a local file system, but in a real system it could be S3, GCS, etc)
-        let object_store: Arc<dyn ObjectStore> =
-            Arc::new(object_store::local::LocalFileSystem::new());
-
-        for table_name in table_names {
-            // Create a custom table provider with our special index.
-            if test == "a" {
-                let parquet_options = ParquetReadOptions::default().parquet_pruning(true);
-                ctx.register_parquet(
-                    table_name,
-                    format!("data/tpch/{}_a0.parquet", table_name),
-                    parquet_options,
-                )
-                .await?;
-            } else if test == "b" {
-                let provider = if false {
-                    Arc::new(zip::ZippedTableProvider::try_new(
-                        Arc::clone(&object_store),
-                        vec![format!("data/tpch/{}_a0.parquet", table_name)],
-                    )?)
-                } else {
-                    Arc::new(zip::ZippedTableProvider::try_new(
-                        Arc::clone(&object_store),
-                        vec![
-                            format!("data/tpch/{}_b0.parquet", table_name),
-                            format!("data/tpch/{}_b1.parquet", table_name),
-                        ],
-                    )?)
-                };
-                ctx.register_table(table_name, Arc::clone(&provider) as _)?;
-            } else if test == "c" {
-                let provider = Arc::new(zip::ZippedTableProvider::try_new(
-                    Arc::clone(&object_store),
-                    vec![
-                        format!("data/tpch/{}_c0.parquet", table_name),
-                        format!("data/tpch/{}_c1.parquet", table_name),
-                        format!("data/tpch/{}_c2.parquet", table_name),
-                    ],
-                )?);
-                ctx.register_table(table_name, Arc::clone(&provider) as _)?;
-            }
-        }
-
-        // register object store provider for urls like `file://` work
-        let url = Url::try_from("file://").unwrap();
-        ctx.register_object_store(&url, object_store);
-
-        for t in 0..trials as u32 {
-            for (i, q) in queries.iter().enumerate().filter(|p| {
-                subset_queries
-                    .as_ref()
-                    .map(|hs: &HashSet<usize>| hs.contains(&(p.0 + 1)))
-                    .unwrap_or(true)
-            }) {
-                println!("Starting Test {}, Q{} (#{})...", test, i + 1, t + 1);
-                let start = Utc::now();
-                for (_seg, query_segment) in q
-                    .split(";")
-                    .filter(|s| s.split_whitespace().collect::<String>() != "")
-                    .enumerate()
-                {
-                    let df = ctx.sql(query_segment).await?;
-                    df.clone().collect().await?;
-                    df.explain(true, true)?.show().await?;
-                }
-                let end = Utc::now();
-                let runtime = (end - start).num_milliseconds();
-                println!("Finished Test {}, Q{}: took {}ms", test, i + 1, runtime);
-                let point = TestResult::new(test.into(), i + 1, t, runtime);
-                results.push(point);
-            }
-        }
-    }
-    Ok(results)
-}
-
 /// Print `EXPLAIN ANALYZE` for one query under each storage variant, so we can
 /// see which physical operators dominate and how much the ZipExec stitching
 /// adds. Each query is run once to warm up before the analyzed run.
@@ -333,15 +284,13 @@ async fn profile_query(cfg: &BenchConfig, q_num: usize) -> Result<()> {
         .find(|(n, _)| *n == q_num)
         .unwrap_or_else(|| panic!("query Q{q_num} not found in {}", cfg.name));
 
+    let storage = Storage::from_env()?;
     for test in ["a", "b", "c"] {
         let ctx = SessionContext::new();
-        let object_store: Arc<dyn ObjectStore> =
-            Arc::new(object_store::local::LocalFileSystem::new());
+        ctx.register_object_store(storage.url.as_ref(), Arc::clone(&storage.store));
         for table in &cfg.tables {
-            register_variant(&ctx, &object_store, cfg.data_dir, table, test).await?;
+            register_variant(&ctx, &storage, cfg, table, test).await?;
         }
-        let url = Url::try_from("file://").unwrap();
-        ctx.register_object_store(&url, object_store);
 
         let label = match test {
             "a" => "control (1 file)",
@@ -421,7 +370,12 @@ async fn main() -> Result<()> {
         cfg.queries.len()
     );
     let results = run_bench(&cfg, 3, None).await?;
-    let out = format!("test-data-{}.csv", cfg.name);
+    let storage_tag = if std::env::var("STORAGE").as_deref() == Ok("s3") {
+        "s3"
+    } else {
+        "local"
+    };
+    let out = format!("test-data-{}-{}.csv", cfg.name, storage_tag);
     let df = results_to_df(results);
     df.write_csv(&out, DataFrameWriteOptions::default(), None)
         .await?;

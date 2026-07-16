@@ -19,15 +19,13 @@ use datafusion::common::stats::Precision;
 use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
 use datafusion::physical_plan::metrics::MetricsSet;
 use std::any::Any;
-use std::fs::File;
-use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use datafusion::catalog::Session;
 use datafusion::common::instant::Instant;
-use datafusion::common::{DFSchema, DataFusionError, Result, Statistics, internal_datafusion_err};
+use datafusion::common::{DFSchema, DataFusionError, Result, Statistics};
 
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::PartitionedFile;
@@ -41,9 +39,7 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::utils::conjunction;
 use datafusion::logical_expr::{TableProviderFilterPushDown, TableType};
-use datafusion::parquet::arrow::arrow_reader::{
-    ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
-};
+use datafusion::parquet::arrow::parquet_to_arrow_schema;
 
 use datafusion::parquet::file::metadata::ParquetMetaData;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
@@ -72,6 +68,8 @@ pub struct ZippedTableProvider {
     schema: SchemaRef,
     /// The underlying object store
     object_store: Arc<dyn ObjectStore>,
+    /// The object store URL the files live under (e.g. `file://` or `s3://bucket`)
+    object_store_url: ObjectStoreUrl,
     metrics: ExecutionPlanMetricsSet,
     num_rows: i64,
 }
@@ -79,14 +77,15 @@ pub struct ZippedTableProvider {
 impl ZippedTableProvider {
     /// Create a new ZippedTableProvider
     /// * `object_store` - the object store implementation to use for reading files
-    pub fn try_new(
+    pub async fn try_new(
         object_store: Arc<dyn ObjectStore>,
-        paths: Vec<impl AsRef<Path>>,
+        object_store_url: ObjectStoreUrl,
+        locations: Vec<object_store::path::Path>,
     ) -> Result<Self> {
-        let zipped_files: Vec<ZippedFile> = paths
-            .iter()
-            .map(|path| ZippedFile::try_new(path))
-            .collect::<Result<Vec<ZippedFile>>>()?;
+        let mut zipped_files = Vec::with_capacity(locations.len());
+        for location in locations {
+            zipped_files.push(ZippedFile::try_new(object_store.as_ref(), location).await?);
+        }
         let schema = SchemaRef::from(Schema::try_merge(
             zipped_files
                 .iter()
@@ -106,6 +105,7 @@ impl ZippedTableProvider {
             zipped_files,
             schema,
             object_store,
+            object_store_url,
             metrics: ExecutionPlanMetricsSet::new(),
             num_rows,
         })
@@ -215,8 +215,8 @@ impl ZippedTableProvider {
 struct ZippedFile {
     /// File name
     file_name: String,
-    /// The path of the file
-    path: PathBuf,
+    /// The object store location (key) of the file
+    location: object_store::path::Path,
     /// The size of the file
     file_size: u64,
     /// The pre-parsed parquet metadata for the file
@@ -258,26 +258,30 @@ pub fn split<T>(slice: &[T], n: usize) -> impl Iterator<Item = &[T]> {
 }
 
 impl ZippedFile {
-    fn try_new(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
+    async fn try_new(
+        store: &dyn ObjectStore,
+        location: object_store::path::Path,
+    ) -> Result<Self> {
+        let file_name = location.filename().unwrap_or_default().to_string();
 
-        // Now, open the file and read its size and metadata
-        let file_name = path
-            .file_name()
-            .ok_or_else(|| internal_datafusion_err!("Invalid path"))?
-            .to_str()
-            .ok_or_else(|| internal_datafusion_err!("Invalid filename"))?
-            .to_string();
-        let file_size = path.metadata()?.len();
+        // Read size + parquet metadata through the object store, so this works
+        // uniformly over a local filesystem, S3, GCS, etc.
+        let object_meta = store
+            .head(&location)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let file_size = object_meta.size;
 
-        let file = File::open(path).map_err(|e| {
-            DataFusionError::from(e).context(format!("Error opening file {path:?}"))
-        })?;
-
-        let options = ArrowReaderOptions::new();
-        let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options)?;
-        let metadata = reader.metadata().clone();
-        let schema = reader.schema().clone();
+        let metadata = DFParquetMetadata::new(store, &object_meta)
+            .fetch_metadata()
+            .await?;
+        let schema = SchemaRef::from(
+            parquet_to_arrow_schema(
+                metadata.file_metadata().schema_descr(),
+                metadata.file_metadata().key_value_metadata(),
+            )
+            .map_err(|e| DataFusionError::External(Box::new(e)))?,
+        );
         let row_group_ranges: Vec<(i64, i64)> = metadata
             .row_groups()
             .iter()
@@ -287,12 +291,10 @@ impl ZippedFile {
                 (start, start + rgm.compressed_size())
             })
             .collect();
-        // canonicalize after writing the file
-        let path = std::fs::canonicalize(path)?;
 
         Ok(Self {
             file_name,
-            path,
+            location,
             file_size,
             metadata,
             schema,
@@ -401,7 +403,7 @@ impl TableProvider for ZippedTableProvider {
         for zipped_file in &self.zipped_files {
             // Prepare for scanning
             let schema = zipped_file.schema.clone();
-            let object_store_url = ObjectStoreUrl::parse("file://")?;
+            let object_store_url = self.object_store_url.clone();
             let statistics = DFParquetMetadata::statistics_from_parquet_metadata(
                 &zipped_file.metadata,
                 &schema.clone(),
@@ -437,7 +439,7 @@ impl TableProvider for ZippedTableProvider {
             // projection vector that is in this file
             if file_projection.clone().map(|proj| proj.len()).unwrap_or(1) > 0 {
                 let zip_partition_info = ZipPartitionInfo::new(
-                    zipped_file.path.display().to_string(),
+                    zipped_file.location.to_string(),
                     zipped_file.file_size,
                     access_plan.clone(),
                     zipped_file.row_group_ranges.clone(),

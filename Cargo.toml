@@ -12,7 +12,7 @@ async-trait = "0.1.89"
 bytes = "1.10.1"
 url = "2.5.7"
 tempfile = "3.23.0"
-object_store = "0.12.4"
+object_store = { version = "0.12.4", features = ["aws"] }
 futures = "0.3.31"
 itertools = "0.14.0"
 chrono = "0.4.42"
