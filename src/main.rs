@@ -28,43 +28,58 @@ use datafusion::prelude::*;
 use object_store::path::Path as ObjPath;
 use object_store::ObjectStore;
 
+pub mod counting_store;
 pub mod zip;
 
 /// Where the parquet files are read from. Chosen with the `STORAGE` env var:
 /// `local` (default) reads from the local filesystem; `s3` reads from an
 /// S3-compatible store (e.g. a local MinIO), configured with the S3_* env vars.
+/// The store is wrapped so we can count requests + bytes (see counting_store).
 struct Storage {
     store: Arc<dyn ObjectStore>,
     url: ObjectStoreUrl,
     s3: bool,
     bucket: String,
+    stats: Arc<counting_store::StoreStats>,
 }
 
 impl Storage {
     fn from_env() -> Result<Self> {
+        let stats = Arc::new(counting_store::StoreStats::default());
         if std::env::var("STORAGE").as_deref() == Ok("s3") {
             let endpoint =
                 std::env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".into());
             let bucket = std::env::var("S3_BUCKET").unwrap_or_else(|_| "bench".into());
             let key = std::env::var("S3_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into());
             let secret = std::env::var("S3_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into());
-            let store = object_store::aws::AmazonS3Builder::new()
-                .with_endpoint(endpoint)
-                .with_bucket_name(&bucket)
-                .with_region("us-east-1")
-                .with_access_key_id(key)
-                .with_secret_access_key(secret)
-                .with_allow_http(true)
-                .build()
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let inner: Arc<dyn ObjectStore> = Arc::new(
+                object_store::aws::AmazonS3Builder::new()
+                    .with_endpoint(endpoint)
+                    .with_bucket_name(&bucket)
+                    .with_region("us-east-1")
+                    .with_access_key_id(key)
+                    .with_secret_access_key(secret)
+                    .with_allow_http(true)
+                    .build()
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?,
+            );
+            let store: Arc<dyn ObjectStore> = Arc::new(
+                counting_store::CountingObjectStore::new(inner, Arc::clone(&stats)),
+            );
             let url = ObjectStoreUrl::parse(format!("s3://{bucket}"))?;
-            Ok(Self { store: Arc::new(store), url, s3: true, bucket })
+            Ok(Self { store, url, s3: true, bucket, stats })
         } else {
+            let inner: Arc<dyn ObjectStore> =
+                Arc::new(object_store::local::LocalFileSystem::new());
+            let store: Arc<dyn ObjectStore> = Arc::new(
+                counting_store::CountingObjectStore::new(inner, Arc::clone(&stats)),
+            );
             Ok(Self {
-                store: Arc::new(object_store::local::LocalFileSystem::new()),
+                store,
                 url: ObjectStoreUrl::parse("file://")?,
                 s3: false,
                 bucket: String::new(),
+                stats,
             })
         }
     }
@@ -312,6 +327,53 @@ async fn profile_query(cfg: &BenchConfig, q_num: usize) -> Result<()> {
     Ok(())
 }
 
+/// Count how the workload hits the object store (GET/HEAD requests and bytes
+/// read) per storage variant, running every query once. This is the raw input
+/// for modeling the $ cost of running on S3, which prices per request + per GB.
+async fn collect_stats(cfg: &BenchConfig) -> Result<()> {
+    let storage = Storage::from_env()?;
+    let backend = if storage.s3 { "s3" } else { "local" };
+    println!(
+        "\n{} object-store interaction ({} backend, each query run once)\n",
+        cfg.name, backend
+    );
+    println!(
+        "{:<16}{:>10}{:>8}{:>10}{:>9}{:>14}",
+        "variant", "GET reqs", "HEAD", "get_rngs", "ranges", "bytes read"
+    );
+    println!("{}", "-".repeat(67));
+    for (test, label) in [
+        ("a", "control 1-file"),
+        ("b", "2-way split"),
+        ("c", "3-way split"),
+    ] {
+        let before = storage.stats.snapshot();
+        let ctx = SessionContext::new();
+        ctx.register_object_store(storage.url.as_ref(), Arc::clone(&storage.store));
+        for table in &cfg.tables {
+            register_variant(&ctx, &storage, cfg, table, test).await?;
+        }
+        for (_q, sql) in &cfg.queries {
+            let _ = run_query(&ctx, sql).await;
+        }
+        let d = storage.stats.snapshot() - before;
+        let mib = d.bytes_read as f64 / (1024.0 * 1024.0);
+        println!(
+            "{:<16}{:>10}{:>8}{:>10}{:>9}{:>10.1} MiB",
+            label,
+            d.total_gets(),
+            d.head_requests,
+            d.get_ranges_calls,
+            d.get_ranges_ranges,
+            mib
+        );
+    }
+    println!(
+        "\nGET reqs = single GETs + each range in a get_ranges batch (upper bound on\nHTTP GETs, since object_store coalesces adjacent ranges). bytes read = actual\ntransfer. Metadata (HEAD + footer) is fetched once per table and cached."
+    );
+    Ok(())
+}
+
 fn results_to_df(results: Vec<TestResult>) -> DataFrame {
     let tests = Arc::new(StringArray::from(
         results
@@ -360,6 +422,11 @@ async fn main() -> Result<()> {
             std::process::exit(1);
         });
         profile_query(&cfg, q).await?;
+        return Ok(());
+    }
+
+    if args.get(2).map(String::as_str) == Some("stats") {
+        collect_stats(&cfg).await?;
         return Ok(());
     }
 
