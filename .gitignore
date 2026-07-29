@@ -4,3 +4,7 @@
 /test-data*.csv
 *_partition_runtime.png
 *_summary.png
+*_storage_compare.png
+/workload-*.csv
+/workload_report-*.png
+/hot_columns-*.csv
