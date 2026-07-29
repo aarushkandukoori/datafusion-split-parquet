@@ -23,10 +23,15 @@ use datafusion::{
 use std::{collections::HashSet, fs, sync::Arc};
 
 use chrono::Utc;
+use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
 use datafusion::execution::object_store::ObjectStoreUrl;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::*;
 use object_store::path::Path as ObjPath;
 use object_store::ObjectStore;
+use rand::{rngs::StdRng, Rng, SeedableRng};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::time::{Duration, Instant};
 
 pub mod counting_store;
 pub mod zip;
@@ -374,6 +379,216 @@ async fn collect_stats(cfg: &BenchConfig) -> Result<()> {
     Ok(())
 }
 
+/// Per-(table, column) compressed size, read from the control files' parquet
+/// footers. Used to estimate how many bytes each referenced column covers --
+/// "inspect the plan before execution for the number of bytes per column".
+async fn column_sizes(
+    storage: &Storage,
+    cfg: &BenchConfig,
+) -> Result<HashMap<(String, String), u64>> {
+    let mut sizes = HashMap::new();
+    for table in &cfg.tables {
+        let key = storage.key(cfg, &format!("{table}_a0.parquet"))?;
+        let object_meta = storage
+            .store
+            .head(&key)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let md = DFParquetMetadata::new(storage.store.as_ref(), &object_meta)
+            .fetch_metadata()
+            .await?;
+        let descr = md.file_metadata().schema_descr_ptr();
+        for rg in md.row_groups() {
+            for (i, col) in rg.columns().iter().enumerate() {
+                *sizes
+                    .entry((table.to_string(), descr.column(i).name().to_string()))
+                    .or_insert(0u64) += col.compressed_size() as u64;
+            }
+        }
+    }
+    Ok(sizes)
+}
+
+/// Collect (table -> columns) referenced by a plan by walking its TableScans:
+/// a scan's projected schema is exactly the set of columns it will read.
+fn plan_columns(plan: &LogicalPlan, out: &mut BTreeMap<String, BTreeSet<String>>) {
+    if let LogicalPlan::TableScan(scan) = plan {
+        let entry = out.entry(scan.table_name.table().to_string()).or_default();
+        for field in scan.projected_schema.fields() {
+            entry.insert(field.name().clone());
+        }
+    }
+    for input in plan.inputs() {
+        plan_columns(input, out);
+    }
+}
+
+struct WorkloadConfig {
+    variant: String,        // a | b | c
+    avg_interval_secs: f64, // average seconds between query arrivals
+    duration_secs: f64,     // how long to keep firing
+    dist: String,           // query-sampling distribution (uniform for now)
+    arrival: String,        // fixed | poisson inter-arrival gaps
+    seed: u64,              // RNG seed, so runs across variants are comparable
+}
+
+/// Fire a steady stream of randomly-sampled benchmark queries for a fixed
+/// duration, logging per-query latency, object-store request/byte deltas, and
+/// which table columns each query referenced. The column log is the input for
+/// finding hot vs cold columns to design a better partition scheme.
+async fn workload(cfg: &BenchConfig, wl: &WorkloadConfig) -> Result<()> {
+    let storage = Storage::from_env()?;
+    let backend = if storage.s3 { "s3" } else { "local" };
+    let ctx = SessionContext::new();
+    ctx.register_object_store(storage.url.as_ref(), Arc::clone(&storage.store));
+    for table in &cfg.tables {
+        register_variant(&ctx, &storage, cfg, table, &wl.variant).await?;
+    }
+    let sizes = column_sizes(&storage, cfg).await?;
+
+    let mut rng = StdRng::seed_from_u64(wl.seed);
+    let n = cfg.queries.len();
+    let mut events: Vec<String> =
+        vec!["t_offset_ms,query_nr,latency_ms,get_requests,bytes_read,ok".into()];
+    let mut colrows: Vec<String> = vec!["t_offset_ms,query_nr,table,column,est_bytes".into()];
+    let mut latencies: Vec<f64> = Vec::new();
+    let (mut total_gets, mut total_bytes) = (0u64, 0u64);
+    let mut touch: BTreeMap<(String, String), u64> = BTreeMap::new();
+
+    println!(
+        "workload: {} variant={} backend={} dist={} arrivals={} avg every {}s for {}s seed={}",
+        cfg.name,
+        wl.variant,
+        backend,
+        wl.dist,
+        wl.arrival,
+        wl.avg_interval_secs,
+        wl.duration_secs,
+        wl.seed
+    );
+
+    let start = Instant::now();
+    let mut next_fire = 0.0f64;
+    let mut fired = 0usize;
+    while next_fire < wl.duration_secs {
+        let now = start.elapsed().as_secs_f64();
+        if now < next_fire {
+            tokio::time::sleep(Duration::from_secs_f64(next_fire - now)).await;
+        }
+        // Sample a query. The match is the extension point for non-uniform
+        // distributions (zipf, hot-set, ...).
+        let idx = match wl.dist.as_str() {
+            _ => rng.gen_range(0..n),
+        };
+        let (qnr, sql) = &cfg.queries[idx];
+
+        // Untimed: which columns does this query read? Walk the optimized
+        // plan of each statement. Note DataFusion executes DDL (e.g. CREATE
+        // VIEW) eagerly at ctx.sql().await, so multi-statement queries plan
+        // correctly here; DDL does no object-store IO, so the per-query
+        // request/byte deltas below are unaffected.
+        let mut cols: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for segment in sql
+            .split(';')
+            .filter(|s| !s.split_whitespace().collect::<String>().is_empty())
+        {
+            if let Ok(df) = ctx.sql(segment).await {
+                if let Ok(plan) = df.into_optimized_plan() {
+                    plan_columns(&plan, &mut cols);
+                }
+            }
+        }
+
+        let t_offset_ms = start.elapsed().as_millis();
+        let before = storage.stats.snapshot();
+        let qstart = Instant::now();
+        let res = run_query(&ctx, sql).await;
+        let latency_ms = qstart.elapsed().as_secs_f64() * 1e3;
+        let d = storage.stats.snapshot() - before;
+        let ok = res.is_ok();
+
+        events.push(format!(
+            "{},{},{:.1},{},{},{}",
+            t_offset_ms,
+            qnr,
+            latency_ms,
+            d.total_gets(),
+            d.bytes_read,
+            ok
+        ));
+        for (table, cs) in &cols {
+            for c in cs {
+                let est = sizes.get(&(table.clone(), c.clone())).copied().unwrap_or(0);
+                colrows.push(format!("{t_offset_ms},{qnr},{table},{c},{est}"));
+                *touch.entry((table.clone(), c.clone())).or_insert(0) += 1;
+            }
+        }
+        if ok {
+            latencies.push(latency_ms);
+        }
+        total_gets += d.total_gets();
+        total_bytes += d.bytes_read;
+        fired += 1;
+        println!(
+            "  t={:>6.1}s Q{:<3} {:>8.1}ms {:>5} GETs {:>11} B  cols={}",
+            t_offset_ms as f64 / 1e3,
+            qnr,
+            latency_ms,
+            d.total_gets(),
+            d.bytes_read,
+            cols.values().map(|s| s.len()).sum::<usize>()
+        );
+
+        // Open-loop arrival schedule: the next fire time advances by the gap
+        // regardless of how long the query took, keeping the average rate; an
+        // overrunning query just makes the next one fire immediately.
+        let gap = match wl.arrival.as_str() {
+            "poisson" => -wl.avg_interval_secs * (1.0 - rng.gen_range(0.0f64..1.0f64)).ln(),
+            _ => wl.avg_interval_secs,
+        };
+        next_fire += gap;
+    }
+
+    let tag = format!("{}-{}-{}-{}", cfg.name, wl.variant, backend, wl.dist);
+    fs::write(
+        format!("workload-events-{tag}.csv"),
+        events.join("\n") + "\n",
+    )?;
+    fs::write(
+        format!("workload-columns-{tag}.csv"),
+        colrows.join("\n") + "\n",
+    )?;
+
+    latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let pct = |p: f64| -> f64 {
+        if latencies.is_empty() {
+            0.0
+        } else {
+            latencies[((latencies.len() as f64 - 1.0) * p) as usize]
+        }
+    };
+    println!(
+        "\n{} queries fired in {:.0}s ({} ok) | latency p50={:.0}ms p95={:.0}ms max={:.0}ms | total {} GETs, {:.1} MiB read",
+        fired,
+        wl.duration_secs,
+        latencies.len(),
+        pct(0.5),
+        pct(0.95),
+        pct(1.0),
+        total_gets,
+        total_bytes as f64 / 1048576.0
+    );
+    let mut hot: Vec<_> = touch.iter().collect();
+    hot.sort_by(|a, b| b.1.cmp(a.1));
+    println!("\nhottest columns (touches across {fired} queries):");
+    for ((t, c), cnt) in hot.iter().take(10) {
+        println!("  {cnt:>4}x  {t}.{c}");
+    }
+    println!("\nwrote workload-events-{tag}.csv and workload-columns-{tag}.csv");
+    println!("next: python3 workload_report.py {tag}");
+    Ok(())
+}
+
 fn results_to_df(results: Vec<TestResult>) -> DataFrame {
     let tests = Arc::new(StringArray::from(
         results
@@ -427,6 +642,26 @@ async fn main() -> Result<()> {
 
     if args.get(2).map(String::as_str) == Some("stats") {
         collect_stats(&cfg).await?;
+        return Ok(());
+    }
+
+    // cargo run --release -- <bench> workload [variant] [avg_interval_s]
+    //   [duration_s] [dist] [arrival] [seed]
+    // e.g. `tpcds workload b 2 60 uniform fixed 42`
+    if args.get(2).map(String::as_str) == Some("workload") {
+        let wl = WorkloadConfig {
+            variant: args.get(3).cloned().unwrap_or_else(|| "a".into()),
+            avg_interval_secs: args.get(4).and_then(|s| s.parse().ok()).unwrap_or(2.0),
+            duration_secs: args.get(5).and_then(|s| s.parse().ok()).unwrap_or(60.0),
+            dist: args.get(6).cloned().unwrap_or_else(|| "uniform".into()),
+            arrival: args.get(7).cloned().unwrap_or_else(|| "fixed".into()),
+            seed: args.get(8).and_then(|s| s.parse().ok()).unwrap_or(42),
+        };
+        if !["a", "b", "c"].contains(&wl.variant.as_str()) {
+            eprintln!("unknown variant '{}'; use a, b, or c", wl.variant);
+            std::process::exit(1);
+        }
+        workload(&cfg, &wl).await?;
         return Ok(());
     }
 
